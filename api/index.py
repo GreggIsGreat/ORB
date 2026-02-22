@@ -4,9 +4,12 @@ from datetime import datetime
 import pytz
 import yfinance as yf
 import pandas as pd
+from mangum import Mangum
 
 app = FastAPI(title="ORB Model V1.0")
 
+# This is what Vercel actually calls
+handler = Mangum(app)
 
 class ORBModel:
     def __init__(self):

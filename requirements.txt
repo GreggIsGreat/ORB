@@ -1,7 +1,6 @@
 fastapi
+mangum
 uvicorn
-pandas
-scikit-learn
-joblib
 yfinance
-numpy
+pandas
+pytz
