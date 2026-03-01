@@ -1,607 +1,433 @@
+# Save this as: api/index.py
+
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from datetime import datetime
 import pytz
-import yfinance as yf
-import pandas as pd
-from mangum import Mangum
+import urllib.request
+import json
 
-app = FastAPI(title="ORB Model V1.0")
+app = FastAPI()
 
-# This is what Vercel actually calls
-handler = Mangum(app)
+CONFIGS = {
+    "NAS100": {
+        "tv": "OANDA:NAS100USD",
+        "max_range": 80, "max_fvg": None, "max_speed": 30, "weekend": False,
+        "range": [(30,45,3),(0,30,1),(45,60,1),(60,80,0)],
+        "fvg": [(15,9999,2),(0,3,2),(7,15,1),(3,7,0)],
+        "speed": [(0,10,3),(10,20,2),(20,30,1)],
+        "best_day": ("Tuesday",3), "good_days": [("Thursday",1)],
+        "worst_day": ("Wednesday",-2), "bias": ("LONG",1)
+    },
+    "BTCUSD": {
+        "tv": "BITSTAMP:BTCUSD",
+        "max_range": 750, "max_fvg": 200, "max_speed": None, "weekend": True,
+        "range": [(350,500,3),(200,350,2),(0,200,1),(500,750,0)],
+        "fvg": [(25,50,3),(0,25,2),(50,100,0),(100,200,0)],
+        "speed": [(60,120,3),(30,60,2),(120,9999,1),(0,30,0)],
+        "best_day": ("Sunday",3), "good_days": [("Saturday",2),("Tuesday",2),("Thursday",1)],
+        "worst_day": ("Friday",-2), "bias": None
+    },
+    "GOLD": {
+        "tv": "OANDA:XAUUSD",
+        "max_range": None, "max_fvg": None, "max_speed": None, "weekend": False,
+        "range": [(0,5,3),(10,15,2),(25,9999,2),(5,10,0),(15,25,0)],
+        "fvg": [(3,5,3),(10,9999,3),(5,10,1),(0,3,0)],
+        "speed": [(30,60,3),(120,9999,2),(10,30,1),(0,10,0),(60,120,0)],
+        "best_day": ("Tuesday",3), "good_days": [("Thursday",1)],
+        "worst_day": ("Monday",-1), "bias": ("SHORT",1)
+    }
+}
 
-class ORBModel:
-    def __init__(self):
-        self.rules = {
-            'max_candles': 30,
-            'max_range': 80,
-            'min_score': 5,
-            'range_sweet_spot': (30, 45),
-            'best_day': 'Tuesday',
-            'worst_day': 'Wednesday',
-            'target_rr': 1.0
-        }
 
-    def score_trade(self, range_size, fvg_size, candles_to_break, direction, date):
-        score = 0
-        reasons = []
+# ═══════════════════════════════════════════════
+# WEB SCRAPER
+# ═══════════════════════════════════════════════
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"}
 
-        if candles_to_break > self.rules['max_candles']:
-            return {"score": 0, "take_trade": False, "confidence": "REJECTED", "reasons": ["Breakout too slow"]}
-        if range_size > self.rules['max_range']:
-            return {"score": 0, "take_trade": False, "confidence": "REJECTED", "reasons": ["Range too wide"]}
+def http_get(url):
+    req = urllib.request.Request(url, headers=HEADERS)
+    resp = urllib.request.urlopen(req, timeout=10)
+    return json.loads(resp.read().decode())
 
-        if self.rules['range_sweet_spot'][0] <= range_size <= self.rules['range_sweet_spot'][1]:
-            score += 3
-            reasons.append("Sweet spot range (30-45)")
-        elif range_size < 30:
-            score += 1
-            reasons.append("Tight range (<30)")
-        elif range_size <= 60:
-            score += 1
-            reasons.append("Acceptable range (45-60)")
 
-        if candles_to_break <= 10:
-            score += 3
-            reasons.append("Fast breakout (<=10)")
-        elif candles_to_break <= 20:
-            score += 2
-            reasons.append("Moderate breakout (<=20)")
-        elif candles_to_break <= 30:
-            score += 1
-            reasons.append("Slow breakout (<=30)")
+def scrape_btc_candles(interval, limit):
+    """Scrape BTC from Binance — free, no key, 1min and 15min"""
+    iv = "1m" if interval == "1min" else "15m"
+    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={iv}&limit={limit}"
+    data = http_get(url)
+    et = pytz.timezone('US/Eastern')
+    candles = []
+    for k in data:
+        ts = int(k[0]) / 1000
+        dt = datetime.fromtimestamp(ts, tz=et)
+        candles.append({
+            "time": dt.strftime("%H:%M"),
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4])
+        })
+    return candles
 
-        if fvg_size >= 15:
-            score += 2
-            reasons.append("Large FVG (>=15)")
-        elif fvg_size <= 3:
-            score += 2
-            reasons.append("Tiny FVG (<=3)")
-        elif fvg_size >= 7:
-            score += 1
-            reasons.append("Medium FVG (7-15)")
 
-        day = pd.to_datetime(date).day_name()
-        if day == self.rules['best_day']:
-            score += 3
-            reasons.append("Tuesday (best day)")
-        elif day == 'Thursday':
-            score += 1
-            reasons.append("Thursday")
-        elif day == self.rules['worst_day']:
-            score -= 2
-            reasons.append("Wednesday (worst day)")
-
-        if direction == "LONG":
-            score += 1
-            reasons.append("Long bias")
-
-        if score >= 7:
-            confidence = "HIGH"
-        elif score >= 5:
-            confidence = "MEDIUM"
-        else:
-            confidence = "LOW"
-
-        return {
-            "score": score,
-            "take_trade": score >= self.rules['min_score'],
-            "confidence": confidence,
-            "reasons": reasons
-        }
-
-    def detect_fvg(self, c1, c2, c3, direction):
-        if direction == "LONG":
-            fvg = c3['low'] - c1['high']
-            if fvg > 0 and c2['close'] > c2['open']:
-                return {"valid": True, "size": fvg, "entry": c3['low']}
-        elif direction == "SHORT":
-            fvg = c1['low'] - c3['high']
-            if fvg > 0 and c2['close'] < c2['open']:
-                return {"valid": True, "size": fvg, "entry": c3['high']}
-        return {"valid": False, "size": 0, "entry": 0}
-
-    def scan(self, candles, ma_50, ma_200, date):
-        or_candles = [c for c in candles if 930 <= int(c['time'].replace(':', '')) <= 944]
-        if len(or_candles) == 0:
-            return None
-
-        range_high = max(c['high'] for c in or_candles)
-        range_low = min(c['low'] for c in or_candles)
-        range_size = range_high - range_low
-        trend = "LONG" if ma_50 > ma_200 else "SHORT"
-        post = [c for c in candles if int(c['time'].replace(':', '')) >= 945]
-
-        if len(post) < 3:
-            return None
-
-        for i in range(len(post) - 2):
-            c1, c2, c3 = post[i], post[i + 1], post[i + 2]
-
-            if trend == "LONG" and c2['close'] > range_high:
-                fvg = self.detect_fvg(c1, c2, c3, "LONG")
-                if fvg['valid']:
-                    prediction = self.score_trade(range_size, fvg['size'], i + 1, "LONG", date)
-                    return {
-                        "direction": "LONG",
-                        "entry": round(fvg['entry'], 2),
-                        "stop": round(range_low, 2),
-                        "target": round(fvg['entry'] + (fvg['entry'] - range_low), 2),
-                        "range_high": round(range_high, 2),
-                        "range_low": round(range_low, 2),
-                        "range_size": round(range_size, 2),
-                        "fvg_size": round(fvg['size'], 2),
-                        "candles_to_break": i + 1,
-                        "prediction": prediction
-                    }
-
-            if trend == "SHORT" and c2['close'] < range_low:
-                fvg = self.detect_fvg(c1, c2, c3, "SHORT")
-                if fvg['valid']:
-                    prediction = self.score_trade(range_size, fvg['size'], i + 1, "SHORT", date)
-                    return {
-                        "direction": "SHORT",
-                        "entry": round(fvg['entry'], 2),
-                        "stop": round(range_high, 2),
-                        "target": round(fvg['entry'] - (range_high - fvg['entry']), 2),
-                        "range_high": round(range_high, 2),
-                        "range_low": round(range_low, 2),
-                        "range_size": round(range_size, 2),
-                        "fvg_size": round(fvg['size'], 2),
-                        "candles_to_break": i + 1,
-                        "prediction": prediction
-                    }
-
+def scrape_tradingview(symbol, exchange, interval, bars):
+    """Scrape from TradingView scanner endpoint"""
+    url = "https://scanner.tradingview.com/forex/scan"
+    # TradingView scanner gives current price, not candles
+    # Use their symbol search for basic data
+    try:
+        search_url = f"https://symbol-search.tradingview.com/symbol_search/v3/?text={symbol}&exchange={exchange}"
+        data = http_get(search_url)
+        return data
+    except:
         return None
 
 
-model = ORBModel()
+def scrape_investing(pair_id, interval, points):
+    """Scrape candle data from Investing.com"""
+    iv_map = {"1min": "60", "15min": "900"}
+    url = f"https://tvc6.investing.com/57112963e0ad4/0/0/0/0/history?symbol={pair_id}&resolution={iv_map.get(interval, '60')}&from={int(datetime.now().timestamp()) - (points * 60 * 15)}&to={int(datetime.now().timestamp())}"
+    try:
+        data = http_get(url)
+        et = pytz.timezone('US/Eastern')
+        candles = []
+        if 't' in data:
+            for i in range(len(data['t'])):
+                dt = datetime.fromtimestamp(data['t'][i], tz=et)
+                candles.append({
+                    "time": dt.strftime("%H:%M"),
+                    "open": data['o'][i],
+                    "high": data['h'][i],
+                    "low": data['l'][i],
+                    "close": data['c'][i]
+                })
+        return candles
+    except:
+        return []
 
 
-def base_html(title, content):
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>{title}</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-            body {{ font-family: -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 20px; }}
-            .container {{ max-width: 600px; margin: 0 auto; }}
-            .header {{ text-align: center; padding: 20px 0; border-bottom: 1px solid #222; margin-bottom: 20px; }}
-            .header h1 {{ font-size: 20px; color: #fff; }}
-            .header p {{ font-size: 13px; color: #666; margin-top: 5px; }}
-            .card {{ background: #111; border: 1px solid #222; border-radius: 8px; padding: 20px; margin-bottom: 15px; }}
-            .status {{ display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-bottom: 15px; }}
-            .status-trade {{ background: #0a3d0a; color: #4ade80; border: 1px solid #166534; }}
-            .status-skip {{ background: #3d2a0a; color: #fbbf24; border: 1px solid #854d0e; }}
-            .status-scanning {{ background: #0a2a3d; color: #60a5fa; border: 1px solid #1e3a5f; }}
-            .status-closed {{ background: #1a1a1a; color: #666; border: 1px solid #333; }}
-            .status-waiting {{ background: #1a1a2a; color: #818cf8; border: 1px solid #312e81; }}
-            .status-error {{ background: #3d0a0a; color: #f87171; border: 1px solid #7f1d1d; }}
-            .message {{ font-size: 16px; color: #fff; margin-bottom: 15px; }}
-            .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
-            .grid-item {{ background: #0a0a0a; border: 1px solid #222; border-radius: 6px; padding: 12px; }}
-            .grid-item .label {{ font-size: 11px; color: #666; text-transform: uppercase; }}
-            .grid-item .value {{ font-size: 18px; color: #fff; font-weight: 600; margin-top: 4px; }}
-            .long {{ color: #4ade80; }}
-            .short {{ color: #f87171; }}
-            .reasons {{ margin-top: 15px; }}
-            .reason {{ background: #0a0a0a; border: 1px solid #222; border-radius: 4px; padding: 8px 12px; margin-bottom: 5px; font-size: 13px; }}
-            .reason:before {{ content: "✓ "; color: #4ade80; }}
-            .score-bar {{ background: #222; border-radius: 4px; height: 8px; margin-top: 8px; }}
-            .score-fill {{ height: 8px; border-radius: 4px; }}
-            .divider {{ border-top: 1px solid #222; margin: 15px 0; }}
-            .footer {{ text-align: center; font-size: 11px; color: #444; margin-top: 20px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>ORB Model V1.0</h1>
-                <p>NAS100 Opening Range Breakout Scanner</p>
-            </div>
-            {content}
-            <div class="footer">Auto-refreshes on page reload</div>
-        </div>
-    </body>
-    </html>
-    """
+def scrape_fcs(symbol, interval):
+    """Scrape from FCS API — free forex/commodity data"""
+    try:
+        url = f"https://fcsapi.com/api-v3/forex/history?symbol={symbol}&period={interval}&access_key=API_KEY"
+        return http_get(url)
+    except:
+        return None
+
+
+def scrape_candles(asset, interval, limit):
+    """Route to correct scraper per asset"""
+    et = pytz.timezone('US/Eastern')
+    
+    if asset == "BTCUSD":
+        return scrape_btc_candles(interval, limit)
+    
+    # For NAS100 and GOLD — use Yahoo chart endpoint (just urllib, no package)
+    tickers = {"NAS100": "NQ=F", "GOLD": "GC=F"}
+    ticker = tickers.get(asset)
+    
+    if not ticker:
+        return []
+    
+    iv = "1m" if interval == "1min" else "15m"
+    period = "1d" if interval == "1min" else "60d"
+    
+    urls = [
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={iv}&range={period}",
+        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval={iv}&range={period}"
+    ]
+    
+    for url in urls:
+        try:
+            data = http_get(url)
+            r = data['chart']['result'][0]
+            if 'timestamp' not in r:
+                continue
+            
+            ts = r['timestamp']
+            q = r['indicators']['quote'][0]
+            candles = []
+            
+            for i in range(len(ts)):
+                if q['open'][i] is None:
+                    continue
+                dt = datetime.fromtimestamp(ts[i], tz=et)
+                candles.append({
+                    "time": dt.strftime("%H:%M"),
+                    "open": q['open'][i],
+                    "high": q['high'][i],
+                    "low": q['low'][i],
+                    "close": q['close'][i]
+                })
+            
+            return candles
+        except:
+            continue
+    
+    return []
+
+
+def scrape_asset(asset):
+    """Scrape all data needed for one asset"""
+    result = {
+        "asset": asset, "tv": CONFIGS[asset]["tv"],
+        "status": "ERROR", "candles": [],
+        "ma50": None, "ma200": None, "price": None, "error": None
+    }
+    
+    try:
+        # 15min for MAs
+        candles_15 = scrape_candles(asset, "15min", 300)
+        
+        if len(candles_15) < 200:
+            result["error"] = f"Only {len(candles_15)} bars of 15min data, need 200"
+            return result
+        
+        closes = [c['close'] for c in candles_15]
+        result["ma50"] = round(sum(closes[-50:]) / 50, 2)
+        result["ma200"] = round(sum(closes[-200:]) / 200, 2)
+        
+        # 1min for candles
+        candles_1 = scrape_candles(asset, "1min", 500)
+        
+        if not candles_1:
+            result["error"] = "No 1min data — market likely closed"
+            result["status"] = "NO_1MIN"
+            return result
+        
+        result["candles"] = candles_1
+        result["price"] = round(candles_1[-1]['close'], 2)
+        result["status"] = "OK"
+        result["candle_count"] = len(candles_1)
+        
+    except Exception as e:
+        result["error"] = str(e)
+    
+    return result
+
+
+def scrape_all():
+    results = {}
+    for asset in ["NAS100", "BTCUSD", "GOLD"]:
+        results[asset] = scrape_asset(asset)
+    return results
+
+
+# ═══════════════════════════════════════════════
+# MODEL
+# ═══════════════════════════════════════════════
+def score_trade(asset, range_size, fvg_size, speed, direction, date):
+    c = CONFIGS[asset]
+    score = 0
+    reasons = []
+    if c["max_range"] and range_size > c["max_range"]:
+        return {"score":0,"take_trade":False,"confidence":"REJECTED","reasons":["Range too wide"]}
+    if c["max_fvg"] and fvg_size > c["max_fvg"]:
+        return {"score":0,"take_trade":False,"confidence":"REJECTED","reasons":["FVG too large"]}
+    if c["max_speed"] and speed > c["max_speed"]:
+        return {"score":0,"take_trade":False,"confidence":"REJECTED","reasons":["Breakout too slow"]}
+    for low,high,pts in c["range"]:
+        if low <= range_size <= high:
+            score += pts
+            if pts > 0: reasons.append(f"Range {low}-{high} (+{pts})")
+            break
+    for low,high,pts in c["fvg"]:
+        if low <= fvg_size <= high:
+            score += pts
+            if pts > 0: reasons.append(f"FVG {low}-{high} (+{pts})")
+            break
+    for low,high,pts in c["speed"]:
+        if low <= speed <= high:
+            score += pts
+            if pts > 0: reasons.append(f"Speed {low}-{high} (+{pts})")
+            break
+    y,m,d = map(int,str(date).split('-')[:3])
+    day = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][datetime(y,m,d).weekday()]
+    if c["best_day"] and day == c["best_day"][0]:
+        score += c["best_day"][1]; reasons.append(f"{day} (+{c['best_day'][1]})")
+    for gd,pts in c["good_days"]:
+        if day == gd: score += pts; reasons.append(f"{day} (+{pts})"); break
+    if c["worst_day"] and day == c["worst_day"][0]:
+        score += c["worst_day"][1]; reasons.append(f"{day} ({c['worst_day'][1]})")
+    if c["bias"] and direction == c["bias"][0]:
+        score += c["bias"][1]; reasons.append(f"{direction} bias (+{c['bias'][1]})")
+    confidence = "HIGH" if score >= 7 else "MEDIUM" if score >= 5 else "LOW"
+    return {"score":score,"take_trade":score>=5,"confidence":confidence,"reasons":reasons}
+
+
+def detect_fvg(c1, c2, c3, direction):
+    if direction == "LONG":
+        fvg = c3['low'] - c1['high']
+        if fvg > 0 and c2['close'] > c2['open']:
+            return {"valid":True,"size":fvg,"entry":c3['low']}
+    elif direction == "SHORT":
+        fvg = c1['low'] - c3['high']
+        if fvg > 0 and c2['close'] < c2['open']:
+            return {"valid":True,"size":fvg,"entry":c3['high']}
+    return {"valid":False,"size":0,"entry":0}
+
+
+def run_scan(asset, scraped):
+    config = CONFIGS[asset]
+    et = pytz.timezone('US/Eastern')
+    now = datetime.now(et)
+    base = {"asset": asset, "tv": config["tv"], "time": now.strftime("%H:%M:%S"), "day": now.strftime("%A")}
+
+    if not config["weekend"] and now.weekday() >= 5:
+        return {**base, "status": "CLOSED", "message": "Weekend — markets closed"}
+    if not config["weekend"] and (now.hour < 9 or (now.hour == 9 and now.minute < 30)):
+        h = 9 - now.hour; m = 30 - now.minute
+        if m < 0: h -= 1; m += 60
+        return {**base, "status": "PRE_MARKET", "message": f"NY opens in {h}h {m}m"}
+    if not config["weekend"] and now.hour >= 16:
+        return {**base, "status": "CLOSED", "message": "NY session ended"}
+
+    if scraped["status"] == "ERROR":
+        return {**base, "status": "ERROR", "message": scraped.get("error", "Scraper failed")}
+
+    ma50 = scraped["ma50"]
+    ma200 = scraped["ma200"]
+    trend = "BULLISH" if ma50 > ma200 else "BEARISH"
+
+    if scraped["status"] in ["NO_1MIN", "NO_CANDLES"]:
+        return {**base, "status": "CLOSED", "message": scraped["error"], "trend": trend, "ma50": ma50, "ma200": ma200}
+
+    candles = scraped["candles"]
+    price = scraped["price"]
+
+    oc = [c for c in candles if 930 <= int(c['time'].replace(':','')) <= 944]
+    if not oc:
+        return {**base, "status": "WAITING", "message": "Waiting for opening range (9:30-9:44 ET)", "trend": trend, "price": price, "ma50": ma50, "ma200": ma200}
+
+    rh = round(max(c['high'] for c in oc), 2)
+    rl = round(min(c['low'] for c in oc), 2)
+    rs = round(rh - rl, 2)
+
+    if config["max_range"] and rs > config["max_range"]:
+        return {**base, "status": "NO_TRADE", "message": f"Range too wide ({rs})", "trend": trend, "price": price, "range_high": rh, "range_low": rl, "range_size": rs}
+
+    post = [c for c in candles if int(c['time'].replace(':','')) >= 945]
+    if len(post) < 3:
+        return {**base, "status": "FORMING", "message": "Waiting for post-range candles", "trend": trend, "price": price, "range_high": rh, "range_low": rl, "range_size": rs}
+
+    today = now.strftime("%Y-%m-%d")
+    t = "LONG" if ma50 > ma200 else "SHORT"
+
+    for i in range(len(post) - 2):
+        c1, c2, c3 = post[i], post[i+1], post[i+2]
+        if t == "LONG" and c2['close'] > rh:
+            fvg = detect_fvg(c1, c2, c3, "LONG")
+            if fvg['valid']:
+                pred = score_trade(asset, rs, fvg['size'], i+1, "LONG", today)
+                return {**base, "status": "TRADE" if pred["take_trade"] else "SKIP",
+                    "message": f"{pred['confidence']} LONG — {'TAKE TRADE' if pred['take_trade'] else 'SKIP'}",
+                    "direction": "LONG", "entry": round(fvg['entry'],2), "stop": rl,
+                    "target": round(fvg['entry']+(fvg['entry']-rl),2), "trend": trend,
+                    "price": price, "range_high": rh, "range_low": rl, "range_size": rs,
+                    "fvg_size": round(fvg['size'],2), "speed": i+1,
+                    "score": pred["score"], "confidence": pred["confidence"],
+                    "reasons": pred["reasons"], "ma50": ma50, "ma200": ma200}
+        if t == "SHORT" and c2['close'] < rl:
+            fvg = detect_fvg(c1, c2, c3, "SHORT")
+            if fvg['valid']:
+                pred = score_trade(asset, rs, fvg['size'], i+1, "SHORT", today)
+                return {**base, "status": "TRADE" if pred["take_trade"] else "SKIP",
+                    "message": f"{pred['confidence']} SHORT — {'TAKE TRADE' if pred['take_trade'] else 'SKIP'}",
+                    "direction": "SHORT", "entry": round(fvg['entry'],2), "stop": rh,
+                    "target": round(fvg['entry']-(rh-fvg['entry']),2), "trend": trend,
+                    "price": price, "range_high": rh, "range_low": rl, "range_size": rs,
+                    "fvg_size": round(fvg['size'],2), "speed": i+1,
+                    "score": pred["score"], "confidence": pred["confidence"],
+                    "reasons": pred["reasons"], "ma50": ma50, "ma200": ma200}
+
+    if price > rh: pm = "Price ABOVE range — Waiting for FVG"
+    elif price < rl: pm = "Price BELOW range — Waiting for FVG"
+    else: pm = "Price INSIDE range — No breakout"
+
+    return {**base, "status": "SCANNING", "message": pm, "trend": trend, "price": price,
+        "range_high": rh, "range_low": rl, "range_size": rs, "ma50": ma50, "ma200": ma200}
+
+
+# ═══════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════
+@app.get("/api/scan")
+def api_scan():
+    scraped = scrape_all()
+    results = {}
+    for asset in ["NAS100", "BTCUSD", "GOLD"]:
+        results[asset] = run_scan(asset, scraped[asset])
+    return JSONResponse(content=results)
+
+
+@app.get("/api/debug")
+def api_debug():
+    scraped = scrape_all()
+    debug = {}
+    for asset, data in scraped.items():
+        debug[asset] = {
+            "status": data["status"],
+            "error": data.get("error"),
+            "ma50": data.get("ma50"),
+            "ma200": data.get("ma200"),
+            "price": data.get("price"),
+            "candle_count": data.get("candle_count", 0),
+            "first_candle": data["candles"][0] if data["candles"] else None,
+            "last_candle": data["candles"][-1] if data["candles"] else None,
+            "source": "Binance" if asset == "BTCUSD" else "Web Scraper"
+        }
+    return JSONResponse(content=debug)
 
 
 @app.get("/", response_class=HTMLResponse)
-def health():
-    et = pytz.timezone('US/Eastern')
-    now = datetime.now(et)
-    content = f"""
-    <div class="card">
-        <span class="status status-scanning">ONLINE</span>
-        <p class="message">Scanner is running</p>
-        <div class="grid">
-            <div class="grid-item">
-                <div class="label">Time (ET)</div>
-                <div class="value">{now.strftime("%H:%M:%S")}</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">Date</div>
-                <div class="value">{now.strftime("%A %b %d")}</div>
-            </div>
-        </div>
+def home():
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ORB Scanner</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={theme:{extend:{colors:{bg:'#09090b',card:'#111113',border:'#1e1e22'}}}}</script>
+</head>
+<body class="bg-bg text-gray-300 min-h-screen p-4">
+<div class="max-w-7xl mx-auto">
+
+  <div class="text-center mb-6 border-b border-border pb-4">
+    <h1 class="text-xl font-bold text-white">ORB Model V1.0</h1>
+    <p class="text-xs text-gray-600 mt-1">NAS100 · BTCUSD · GOLD</p>
+    <div class="flex items-center justify-center gap-3 mt-2">
+      <p class="text-xs text-gray-600" id="clock"></p>
+      <span class="text-xs px-2 py-0.5 rounded-full bg-green-500/10 border border-green-500/30 text-green-400" id="dot">LIVE</span>
     </div>
-    <div class="card">
-        <p style="font-size: 13px; color: #666;">Hit <span style="color: #fff;">/scan</span> to run the scanner</p>
-    </div>
-    """
-    return base_html("ORB Model V1.0", content)
+  </div>
 
+  <div class="grid grid-cols-1 md:grid-cols-3 gap-4" id="dash">
+    <div class="bg-card border border-border rounded-lg p-6 animate-pulse"><div class="h-4 bg-border rounded w-24 mb-3"></div><div class="h-8 bg-border rounded w-32"></div></div>
+    <div class="bg-card border border-border rounded-lg p-6 animate-pulse"><div class="h-4 bg-border rounded w-24 mb-3"></div><div class="h-8 bg-border rounded w-32"></div></div>
+    <div class="bg-card border border-border rounded-lg p-6 animate-pulse"><div class="h-4 bg-border rounded w-24 mb-3"></div><div class="h-8 bg-border rounded w-32"></div></div>
+  </div>
 
-@app.get("/scan", response_class=HTMLResponse)
-def scan():
-    et = pytz.timezone('US/Eastern')
-    now = datetime.now(et)
-    today = now.strftime("%Y-%m-%d")
-    day_name = now.strftime("%A")
-    current_time = now.strftime("%H:%M:%S")
+  <div class="text-center mt-4"><p class="text-[10px] text-gray-700" id="upd"></p></div>
 
-    # Weekend
-    if now.weekday() >= 5:
-        content = f"""
-        <div class="card">
-            <span class="status status-closed">CLOSED</span>
-            <p class="message">Markets closed — {day_name}</p>
-            <div class="grid">
-                <div class="grid-item">
-                    <div class="label">Time (ET)</div>
-                    <div class="value">{current_time}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Next Open</div>
-                    <div class="value">Monday 9:30</div>
-                </div>
-            </div>
-        </div>
-        """
-        return base_html("ORB — Closed", content)
-
-    # Pre-market
-    if now.hour < 9 or (now.hour == 9 and now.minute < 30):
-        hours_left = 9 - now.hour
-        mins_left = 30 - now.minute
-        if mins_left < 0:
-            hours_left -= 1
-            mins_left += 60
-        content = f"""
-        <div class="card">
-            <span class="status status-waiting">PRE-MARKET</span>
-            <p class="message">NY session opens in {hours_left}h {mins_left}m</p>
-            <div class="grid">
-                <div class="grid-item">
-                    <div class="label">Time (ET)</div>
-                    <div class="value">{current_time}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Day</div>
-                    <div class="value">{day_name}</div>
-                </div>
-            </div>
-        </div>
-        """
-        return base_html("ORB — Pre-Market", content)
-
-    # Post-market
-    if now.hour >= 16:
-        content = f"""
-        <div class="card">
-            <span class="status status-closed">CLOSED</span>
-            <p class="message">NY session ended for today</p>
-            <div class="grid">
-                <div class="grid-item">
-                    <div class="label">Time (ET)</div>
-                    <div class="value">{current_time}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Day</div>
-                    <div class="value">{day_name}</div>
-                </div>
-            </div>
-        </div>
-        """
-        return base_html("ORB — Closed", content)
-
-    # Fetch data
-    ticker = yf.Ticker("NQ=F")
-    data_15min = ticker.history(period="60d", interval="15m")
-
-    if len(data_15min) == 0:
-        content = """
-        <div class="card">
-            <span class="status status-error">ERROR</span>
-            <p class="message">Failed to fetch market data</p>
-        </div>
-        """
-        return base_html("ORB — Error", content)
-
-    data_15min['MA_50'] = data_15min['Close'].rolling(50).mean()
-    data_15min['MA_200'] = data_15min['Close'].rolling(200).mean()
-    ma_50 = data_15min['MA_50'].iloc[-1]
-    ma_200 = data_15min['MA_200'].iloc[-1]
-
-    if pd.isna(ma_50) or pd.isna(ma_200):
-        content = """
-        <div class="card">
-            <span class="status status-error">ERROR</span>
-            <p class="message">Not enough data for MA calculation</p>
-        </div>
-        """
-        return base_html("ORB — Error", content)
-
-    trend = "BULLISH" if ma_50 > ma_200 else "BEARISH"
-    trend_color = "long" if trend == "BULLISH" else "short"
-
-    data_1min = ticker.history(period="1d", interval="1m")
-
-    if len(data_1min) == 0:
-        content = f"""
-        <div class="card">
-            <span class="status status-waiting">NO DATA</span>
-            <p class="message">No 1min data available</p>
-            <div class="divider"></div>
-            <div class="grid">
-                <div class="grid-item">
-                    <div class="label">Trend</div>
-                    <div class="value {trend_color}">{trend}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">MA Gap</div>
-                    <div class="value">{round(abs(ma_50 - ma_200), 2)}</div>
-                </div>
-            </div>
-        </div>
-        """
-        return base_html("ORB — No Data", content)
-
-    data_1min.index = data_1min.index.tz_convert(et)
-    candles = []
-    for idx, row in data_1min.iterrows():
-        candles.append({
-            "time": idx.strftime("%H:%M"),
-            "open": row['Open'],
-            "high": row['High'],
-            "low": row['Low'],
-            "close": row['Close']
-        })
-
-    current_price = round(data_1min['Close'].iloc[-1], 2)
-    or_candles = [c for c in candles if 930 <= int(c['time'].replace(':', '')) <= 944]
-
-    # Waiting for range
-    if len(or_candles) == 0:
-        content = f"""
-        <div class="card">
-            <span class="status status-waiting">WAITING</span>
-            <p class="message">Waiting for opening range (9:30-9:44 ET)</p>
-            <div class="divider"></div>
-            <div class="grid">
-                <div class="grid-item">
-                    <div class="label">Trend</div>
-                    <div class="value {trend_color}">{trend}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Price</div>
-                    <div class="value">{current_price}</div>
-                </div>
-            </div>
-        </div>
-        """
-        return base_html("ORB — Waiting", content)
-
-    # Range forming
-    if len(or_candles) < 15 and now.hour == 9 and now.minute < 45:
-        content = f"""
-        <div class="card">
-            <span class="status status-waiting">FORMING</span>
-            <p class="message">Opening range forming — {len(or_candles)}/15 candles</p>
-            <div class="score-bar">
-                <div class="score-fill" style="width: {int(len(or_candles)/15*100)}%; background: #818cf8;"></div>
-            </div>
-            <div class="divider"></div>
-            <div class="grid">
-                <div class="grid-item">
-                    <div class="label">Trend</div>
-                    <div class="value {trend_color}">{trend}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Price</div>
-                    <div class="value">{current_price}</div>
-                </div>
-            </div>
-        </div>
-        """
-        return base_html("ORB — Forming", content)
-
-    range_high = round(max(c['high'] for c in or_candles), 2)
-    range_low = round(min(c['low'] for c in or_candles), 2)
-    range_size = round(range_high - range_low, 2)
-
-    # Range too wide
-    if range_size > 80:
-        content = f"""
-        <div class="card">
-            <span class="status status-skip">NO TRADE</span>
-            <p class="message">Range too wide — Skipping today</p>
-            <div class="divider"></div>
-            <div class="grid">
-                <div class="grid-item">
-                    <div class="label">Range Size</div>
-                    <div class="value short">{range_size} pts</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Max Allowed</div>
-                    <div class="value">80 pts</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Range High</div>
-                    <div class="value">{range_high}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Range Low</div>
-                    <div class="value">{range_low}</div>
-                </div>
-            </div>
-        </div>
-        """
-        return base_html("ORB — No Trade", content)
-
-    # Run scan
-    result = model.scan(candles, ma_50, ma_200, today)
-
-    # No breakout yet
-    if result is None:
-        if current_price > range_high:
-            price_msg = "Price ABOVE range — Waiting for FVG"
-            price_color = "long"
-        elif current_price < range_low:
-            price_msg = "Price BELOW range — Waiting for FVG"
-            price_color = "short"
-        else:
-            price_msg = "Price INSIDE range — No breakout"
-            price_color = ""
-
-        range_label = "Sweet Spot ✓" if 30 <= range_size <= 45 else f"{range_size} pts"
-
-        content = f"""
-        <div class="card">
-            <span class="status status-scanning">SCANNING</span>
-            <p class="message">{price_msg}</p>
-            <div class="divider"></div>
-            <div class="grid">
-                <div class="grid-item">
-                    <div class="label">Price</div>
-                    <div class="value {price_color}">{current_price}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Trend</div>
-                    <div class="value {trend_color}">{trend}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Range High</div>
-                    <div class="value">{range_high}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Range Low</div>
-                    <div class="value">{range_low}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Range Size</div>
-                    <div class="value">{range_label}</div>
-                </div>
-                <div class="grid-item">
-                    <div class="label">Day</div>
-                    <div class="value">{day_name}</div>
-                </div>
-            </div>
-        </div>
-        """
-        return base_html("ORB — Scanning", content)
-
-    # Signal found
-    pred = result['prediction']
-    direction = result['direction']
-    dir_color = "long" if direction == "LONG" else "short"
-    score = pred['score']
-    score_pct = min(int(score / 11 * 100), 100)
-    score_color = "#4ade80" if score >= 7 else "#fbbf24" if score >= 5 else "#f87171"
-
-    if pred['take_trade']:
-        status_class = "status-trade"
-        status_label = "TRADE"
-        title = f"ORB — {pred['confidence']} {direction}"
-        msg = f"{pred['confidence']} confidence {direction} — TAKE TRADE"
-    else:
-        status_class = "status-skip"
-        status_label = "SKIP"
-        title = "ORB — Skip"
-        msg = f"Score too low ({score}) — SKIP THIS TRADE"
-
-    reasons_html = ""
-    for r in pred['reasons']:
-        reasons_html += f'<div class="reason">{r}</div>'
-
-    content = f"""
-    <div class="card">
-        <span class="status {status_class}">{status_label}</span>
-        <p class="message">{msg}</p>
-        <div class="divider"></div>
-        <div class="grid">
-            <div class="grid-item">
-                <div class="label">Direction</div>
-                <div class="value {dir_color}">{"📈 " + direction if direction == "LONG" else "📉 " + direction}</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">Score</div>
-                <div class="value" style="color: {score_color}">{score}/11</div>
-            </div>
-        </div>
-        <div class="score-bar">
-            <div class="score-fill" style="width: {score_pct}%; background: {score_color};"></div>
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="grid">
-            <div class="grid-item">
-                <div class="label">Entry</div>
-                <div class="value {dir_color}">{result['entry']}</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">Stop Loss</div>
-                <div class="value short">{result['stop']}</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">Target (1R)</div>
-                <div class="value long">{result['target']}</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">Current Price</div>
-                <div class="value">{current_price}</div>
-            </div>
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="grid">
-            <div class="grid-item">
-                <div class="label">Range High</div>
-                <div class="value">{result['range_high']}</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">Range Low</div>
-                <div class="value">{result['range_low']}</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">Range Size</div>
-                <div class="value">{result['range_size']} pts</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">FVG Size</div>
-                <div class="value">{result['fvg_size']} pts</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">Breakout Speed</div>
-                <div class="value">{result['candles_to_break']} candles</div>
-            </div>
-            <div class="grid-item">
-                <div class="label">Trend</div>
-                <div class="value {trend_color}">{trend}</div>
-            </div>
-        </div>
-    </div>
-
-    <div class="card">
-        <div class="label" style="margin-bottom: 10px;">REASONS</div>
-        {reasons_html}
-    </div>
-    """
-    return base_html(title, content)
+</div>
+<script>
+const ST={TRADE:{bg:'bg-green-500/10',b:'border-green-500/30',t:'text-green-400',l:'TRADE'},SKIP:{bg:'bg-yellow-500/10',b:'border-yellow-500/30',t:'text-yellow-400',l:'SKIP'},SCANNING:{bg:'bg-blue-500/10',b:'border-blue-500/30',t:'text-blue-400',l:'SCANNING'},CLOSED:{bg:'bg-gray-500/10',b:'border-gray-500/30',t:'text-gray-500',l:'CLOSED'},PRE_MARKET:{bg:'bg-purple-500/10',b:'border-purple-500/30',t:'text-purple-400',l:'PRE-MARKET'},WAITING:{bg:'bg-purple-500/10',b:'border-purple-500/30',t:'text-purple-400',l:'WAITING'},FORMING:{bg:'bg-purple-500/10',b:'border-purple-500/30',t:'text-purple-400',l:'FORMING'},NO_TRADE:{bg:'bg-yellow-500/10',b:'border-yellow-500/30',t:'text-yellow-400',l:'NO TRADE'},ERROR:{bg:'bg-red-500/10',b:'border-red-500/30',t:'text-red-400',l:'ERROR'}};
+function bd(s){const x=ST[s]||ST.ERROR;return`<span class="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-bold ${x.bg} ${x.b} ${x.t} border uppercase tracking-wide">${x.l}</span>`}
+function gi(l,v,c='text-white'){return`<div class="bg-bg border border-border rounded px-3 py-2"><div class="text-[9px] text-gray-600 uppercase tracking-wide">${l}</div><div class="text-sm font-semibold mt-0.5 ${c}">${v}</div></div>`}
+function br(s){const p=Math.min(Math.round(s/12*100),100),c=s>=7?'#4ade80':s>=5?'#fbbf24':'#f87171';return`<div class="bg-gray-800 rounded h-1 mt-2"><div class="h-1 rounded" style="width:${p}%;background:${c}"></div></div>`}
+function render(d){let h=`<div class="bg-card border border-border rounded-lg p-4"><div class="flex items-center justify-between mb-3"><span class="text-[10px] text-gray-600 uppercase tracking-widest font-medium">${d.asset} · ${d.tv}</span>${bd(d.status)}</div><p class="text-sm text-white mb-3">${d.message}</p>`;
+if(d.status==='TRADE'||d.status==='SKIP'){const dc=d.direction==='LONG'?'text-green-400':'text-red-400',ic=d.direction==='LONG'?'↑':'↓',sc=d.score>=7?'text-green-400':d.score>=5?'text-yellow-400':'text-red-400';
+h+=`<div class="grid grid-cols-2 gap-1.5 mb-2">${gi('Direction',`${ic} ${d.direction}`,dc)}${gi('Score',`${d.score}/12`,sc)}</div>${br(d.score)}<div class="border-t border-border my-3"></div><div class="grid grid-cols-2 gap-1.5">${gi('Entry',d.entry,dc)}${gi('Stop',d.stop,'text-red-400')}${gi('Target',d.target,'text-green-400')}${gi('Price',d.price)}${gi('Range',d.range_size)}${gi('FVG',d.fvg_size)}${gi('Speed',`${d.speed} candles`)}${gi('Trend',d.trend,d.trend==='BULLISH'?'text-green-400':'text-red-400')}</div>`;
+if(d.reasons&&d.reasons.length){h+=`<div class="border-t border-border my-3"></div>`;d.reasons.forEach(r=>{h+=`<div class="text-[11px] text-gray-400 py-0.5"><span class="text-green-400 mr-1">✓</span>${r}</div>`})}}
+else if(['SCANNING','WAITING','FORMING','NO_TRADE'].includes(d.status)){const tc=d.trend==='BULLISH'?'text-green-400':d.trend==='BEARISH'?'text-red-400':'';h+=`<div class="grid grid-cols-2 gap-1.5">`;if(d.price)h+=gi('Price',d.price);if(d.trend)h+=gi('Trend',d.trend,tc);if(d.range_high)h+=gi('High',d.range_high);if(d.range_low)h+=gi('Low',d.range_low);if(d.range_size)h+=gi('Range',d.range_size);if(d.ma50&&d.ma200)h+=gi('MA Gap',Math.abs(d.ma50-d.ma200).toFixed(2));h+=`</div>`}
+else if(d.trend){const tc=d.trend==='BULLISH'?'text-green-400':'text-red-400';h+=`<div class="grid grid-cols-2 gap-1.5">${gi('Trend',d.trend,tc)}`;if(d.ma50&&d.ma200)h+=gi('MA Gap',Math.abs(d.ma50-d.ma200).toFixed(2));h+=`</div>`}
+h+=`</div>`;return h}
+let n=0;
+async function go(){const dot=document.getElementById('dot');try{dot.textContent='⟳';dot.className='text-xs px-2 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-400';const r=await fetch('/api/scan'),d=await r.json();document.getElementById('dash').innerHTML=render(d.NAS100)+render(d.BTCUSD)+render(d.GOLD);n++;document.getElementById('upd').textContent=`Refresh #${n} · ${new Date().toLocaleTimeString()}`;dot.textContent='LIVE';dot.className='text-xs px-2 py-0.5 rounded-full bg-green-500/10 border border-green-500/30 text-green-400'}catch(e){dot.textContent='ERROR';dot.className='text-xs px-2 py-0.5 rounded-full bg-red-500/10 border border-red-500/30 text-red-400';document.getElementById('upd').textContent=`Error: ${e.message}`}}
+function ck(){const now=new Date(),et=now.toLocaleString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}),day=now.toLocaleString('en-US',{timeZone:'America/New_York',weekday:'long',month:'short',day:'numeric'});document.getElementById('clock').textContent=`${day} · ${et} ET`}
+go();setInterval(go,2000);setInterval(ck,1000);ck();
+</script>
+</body>
+</html>"""
