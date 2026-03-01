@@ -6,12 +6,17 @@ from datetime import datetime
 import pytz
 import urllib.request
 import json
+import os
 
 app = FastAPI()
+
+# Set your Twelve Data key here or in Vercel env vars
+TWELVE_KEY = os.environ.get("TWELVE_KEY", "79dfaf0c92654a44a01f7d8c947aea43")
 
 CONFIGS = {
     "NAS100": {
         "tv": "OANDA:NAS100USD",
+        "twelve": "NAS100/USD",
         "max_range": 80, "max_fvg": None, "max_speed": 30, "weekend": False,
         "range": [(30,45,3),(0,30,1),(45,60,1),(60,80,0)],
         "fvg": [(15,9999,2),(0,3,2),(7,15,1),(3,7,0)],
@@ -30,6 +35,7 @@ CONFIGS = {
     },
     "GOLD": {
         "tv": "OANDA:XAUUSD",
+        "twelve": "XAU/USD",
         "max_range": None, "max_fvg": None, "max_speed": None, "weekend": False,
         "range": [(0,5,3),(10,15,2),(25,9999,2),(5,10,0),(15,25,0)],
         "fvg": [(3,5,3),(10,9999,3),(5,10,1),(0,3,0)],
@@ -39,28 +45,45 @@ CONFIGS = {
     }
 }
 
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ═══════════════════════════════════════════════
-# WEB SCRAPER
+# CACHE — avoid hitting rate limits
 # ═══════════════════════════════════════════════
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"}
+cache = {}
+CACHE_TTL = 30  # seconds
 
+
+def get_cached(key):
+    if key in cache:
+        data, ts = cache[key]
+        if (datetime.now().timestamp() - ts) < CACHE_TTL:
+            return data
+    return None
+
+
+def set_cached(key, data):
+    cache[key] = (data, datetime.now().timestamp())
+
+
+# ═══════════════════════════════════════════════
+# SCRAPERS
+# ═══════════════════════════════════════════════
 def http_get(url):
     req = urllib.request.Request(url, headers=HEADERS)
-    resp = urllib.request.urlopen(req, timeout=10)
+    resp = urllib.request.urlopen(req, timeout=15)
     return json.loads(resp.read().decode())
 
 
-def scrape_btc_candles(interval, limit):
-    """Scrape BTC from Binance — free, no key, 1min and 15min"""
+def scrape_binance(interval, limit):
+    """BTC from Binance — free, no key"""
     iv = "1m" if interval == "1min" else "15m"
     url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={iv}&limit={limit}"
     data = http_get(url)
     et = pytz.timezone('US/Eastern')
     candles = []
     for k in data:
-        ts = int(k[0]) / 1000
-        dt = datetime.fromtimestamp(ts, tz=et)
+        dt = datetime.fromtimestamp(int(k[0]) / 1000, tz=et)
         candles.append({
             "time": dt.strftime("%H:%M"),
             "open": float(k[1]),
@@ -71,139 +94,77 @@ def scrape_btc_candles(interval, limit):
     return candles
 
 
-def scrape_tradingview(symbol, exchange, interval, bars):
-    """Scrape from TradingView scanner endpoint"""
-    url = "https://scanner.tradingview.com/forex/scan"
-    # TradingView scanner gives current price, not candles
-    # Use their symbol search for basic data
-    try:
-        search_url = f"https://symbol-search.tradingview.com/symbol_search/v3/?text={symbol}&exchange={exchange}"
-        data = http_get(search_url)
-        return data
-    except:
-        return None
+def scrape_twelve(symbol, interval, bars):
+    """NAS100 and GOLD from Twelve Data — free key"""
+    iv = "1min" if interval == "1min" else "15min"
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={iv}&outputsize={bars}&apikey={TWELVE_KEY}"
+    data = http_get(url)
 
-
-def scrape_investing(pair_id, interval, points):
-    """Scrape candle data from Investing.com"""
-    iv_map = {"1min": "60", "15min": "900"}
-    url = f"https://tvc6.investing.com/57112963e0ad4/0/0/0/0/history?symbol={pair_id}&resolution={iv_map.get(interval, '60')}&from={int(datetime.now().timestamp()) - (points * 60 * 15)}&to={int(datetime.now().timestamp())}"
-    try:
-        data = http_get(url)
-        et = pytz.timezone('US/Eastern')
-        candles = []
-        if 't' in data:
-            for i in range(len(data['t'])):
-                dt = datetime.fromtimestamp(data['t'][i], tz=et)
-                candles.append({
-                    "time": dt.strftime("%H:%M"),
-                    "open": data['o'][i],
-                    "high": data['h'][i],
-                    "low": data['l'][i],
-                    "close": data['c'][i]
-                })
-        return candles
-    except:
+    if "values" not in data:
         return []
 
-
-def scrape_fcs(symbol, interval):
-    """Scrape from FCS API — free forex/commodity data"""
-    try:
-        url = f"https://fcsapi.com/api-v3/forex/history?symbol={symbol}&period={interval}&access_key=API_KEY"
-        return http_get(url)
-    except:
-        return None
-
-
-def scrape_candles(asset, interval, limit):
-    """Route to correct scraper per asset"""
     et = pytz.timezone('US/Eastern')
-    
-    if asset == "BTCUSD":
-        return scrape_btc_candles(interval, limit)
-    
-    # For NAS100 and GOLD — use Yahoo chart endpoint (just urllib, no package)
-    tickers = {"NAS100": "NQ=F", "GOLD": "GC=F"}
-    ticker = tickers.get(asset)
-    
-    if not ticker:
-        return []
-    
-    iv = "1m" if interval == "1min" else "15m"
-    period = "1d" if interval == "1min" else "60d"
-    
-    urls = [
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={iv}&range={period}",
-        f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?interval={iv}&range={period}"
-    ]
-    
-    for url in urls:
+    candles = []
+    for v in reversed(data["values"]):
         try:
-            data = http_get(url)
-            r = data['chart']['result'][0]
-            if 'timestamp' not in r:
-                continue
-            
-            ts = r['timestamp']
-            q = r['indicators']['quote'][0]
-            candles = []
-            
-            for i in range(len(ts)):
-                if q['open'][i] is None:
-                    continue
-                dt = datetime.fromtimestamp(ts[i], tz=et)
-                candles.append({
-                    "time": dt.strftime("%H:%M"),
-                    "open": q['open'][i],
-                    "high": q['high'][i],
-                    "low": q['low'][i],
-                    "close": q['close'][i]
-                })
-            
-            return candles
+            dt = datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S")
+            candles.append({
+                "time": dt.strftime("%H:%M"),
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low": float(v["low"]),
+                "close": float(v["close"])
+            })
         except:
             continue
-    
-    return []
+    return candles
 
 
 def scrape_asset(asset):
-    """Scrape all data needed for one asset"""
+    """Scrape one asset — routes to correct source"""
+    cached = get_cached(asset)
+    if cached:
+        return cached
+
     result = {
         "asset": asset, "tv": CONFIGS[asset]["tv"],
         "status": "ERROR", "candles": [],
         "ma50": None, "ma200": None, "price": None, "error": None
     }
-    
+
     try:
-        # 15min for MAs
-        candles_15 = scrape_candles(asset, "15min", 300)
-        
+        if asset == "BTCUSD":
+            candles_15 = scrape_binance("15min", 300)
+            candles_1 = scrape_binance("1min", 500)
+        else:
+            symbol = CONFIGS[asset]["twelve"]
+            candles_15 = scrape_twelve(symbol, "15min", 300)
+            candles_1 = scrape_twelve(symbol, "1min", 500)
+
         if len(candles_15) < 200:
-            result["error"] = f"Only {len(candles_15)} bars of 15min data, need 200"
+            result["error"] = f"Only {len(candles_15)} bars of 15min, need 200"
+            set_cached(asset, result)
             return result
-        
+
         closes = [c['close'] for c in candles_15]
         result["ma50"] = round(sum(closes[-50:]) / 50, 2)
         result["ma200"] = round(sum(closes[-200:]) / 200, 2)
-        
-        # 1min for candles
-        candles_1 = scrape_candles(asset, "1min", 500)
-        
+
         if not candles_1:
-            result["error"] = "No 1min data — market likely closed"
+            result["error"] = "No 1min data"
             result["status"] = "NO_1MIN"
+            set_cached(asset, result)
             return result
-        
+
         result["candles"] = candles_1
         result["price"] = round(candles_1[-1]['close'], 2)
         result["status"] = "OK"
         result["candle_count"] = len(candles_1)
-        
+
     except Exception as e:
         result["error"] = str(e)
-    
+
+    set_cached(asset, result)
     return result
 
 
@@ -298,7 +259,7 @@ def run_scan(asset, scraped):
 
     oc = [c for c in candles if 930 <= int(c['time'].replace(':','')) <= 944]
     if not oc:
-        return {**base, "status": "WAITING", "message": "Waiting for opening range (9:30-9:44 ET)", "trend": trend, "price": price, "ma50": ma50, "ma200": ma200}
+        return {**base, "status": "WAITING", "message": "Waiting for opening range", "trend": trend, "price": price, "ma50": ma50, "ma200": ma200}
 
     rh = round(max(c['high'] for c in oc), 2)
     rl = round(min(c['low'] for c in oc), 2)
@@ -375,7 +336,7 @@ def api_debug():
             "candle_count": data.get("candle_count", 0),
             "first_candle": data["candles"][0] if data["candles"] else None,
             "last_candle": data["candles"][-1] if data["candles"] else None,
-            "source": "Binance" if asset == "BTCUSD" else "Web Scraper"
+            "source": "Binance" if asset == "BTCUSD" else "Twelve Data"
         }
     return JSONResponse(content=debug)
 
@@ -393,7 +354,6 @@ def home():
 </head>
 <body class="bg-bg text-gray-300 min-h-screen p-4">
 <div class="max-w-7xl mx-auto">
-
   <div class="text-center mb-6 border-b border-border pb-4">
     <h1 class="text-xl font-bold text-white">ORB Model V1.0</h1>
     <p class="text-xs text-gray-600 mt-1">NAS100 · BTCUSD · GOLD</p>
@@ -402,15 +362,12 @@ def home():
       <span class="text-xs px-2 py-0.5 rounded-full bg-green-500/10 border border-green-500/30 text-green-400" id="dot">LIVE</span>
     </div>
   </div>
-
   <div class="grid grid-cols-1 md:grid-cols-3 gap-4" id="dash">
     <div class="bg-card border border-border rounded-lg p-6 animate-pulse"><div class="h-4 bg-border rounded w-24 mb-3"></div><div class="h-8 bg-border rounded w-32"></div></div>
     <div class="bg-card border border-border rounded-lg p-6 animate-pulse"><div class="h-4 bg-border rounded w-24 mb-3"></div><div class="h-8 bg-border rounded w-32"></div></div>
     <div class="bg-card border border-border rounded-lg p-6 animate-pulse"><div class="h-4 bg-border rounded w-24 mb-3"></div><div class="h-8 bg-border rounded w-32"></div></div>
   </div>
-
   <div class="text-center mt-4"><p class="text-[10px] text-gray-700" id="upd"></p></div>
-
 </div>
 <script>
 const ST={TRADE:{bg:'bg-green-500/10',b:'border-green-500/30',t:'text-green-400',l:'TRADE'},SKIP:{bg:'bg-yellow-500/10',b:'border-yellow-500/30',t:'text-yellow-400',l:'SKIP'},SCANNING:{bg:'bg-blue-500/10',b:'border-blue-500/30',t:'text-blue-400',l:'SCANNING'},CLOSED:{bg:'bg-gray-500/10',b:'border-gray-500/30',t:'text-gray-500',l:'CLOSED'},PRE_MARKET:{bg:'bg-purple-500/10',b:'border-purple-500/30',t:'text-purple-400',l:'PRE-MARKET'},WAITING:{bg:'bg-purple-500/10',b:'border-purple-500/30',t:'text-purple-400',l:'WAITING'},FORMING:{bg:'bg-purple-500/10',b:'border-purple-500/30',t:'text-purple-400',l:'FORMING'},NO_TRADE:{bg:'bg-yellow-500/10',b:'border-yellow-500/30',t:'text-yellow-400',l:'NO TRADE'},ERROR:{bg:'bg-red-500/10',b:'border-red-500/30',t:'text-red-400',l:'ERROR'}};
