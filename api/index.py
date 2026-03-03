@@ -8,7 +8,7 @@ import urllib.request
 import json
 import os
 import ssl
-import re
+import gzip
 
 app = FastAPI()
 
@@ -18,8 +18,8 @@ app = FastAPI()
 CONFIGS = {
     "NAS100": {
         "tv": "OANDA:NAS100USD",
-        "investing_pair": "indices/nq-100-futures",
         "investing_id": "8874",
+        "yahoo": "NQ=F",
         "max_range": 80, 
         "max_fvg": None, 
         "max_speed": 30, 
@@ -36,8 +36,8 @@ CONFIGS = {
     
     "BTCUSD": {
         "tv": "BITSTAMP:BTCUSD",
-        "investing_pair": None,  # Use Binance for BTC
         "investing_id": None,
+        "yahoo": "BTC-USD",
         "max_range": 750, 
         "max_fvg": 200, 
         "max_speed": None, 
@@ -54,8 +54,8 @@ CONFIGS = {
     
     "GOLD": {
         "tv": "OANDA:XAUUSD",
-        "investing_pair": "commodities/gold",
         "investing_id": "8830",
+        "yahoo": "GC=F",
         "max_range": None,
         "max_fvg": None,
         "max_speed": None,
@@ -96,15 +96,6 @@ CONFIGS = {
     }
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
-
 # ═══════════════════════════════════════════════
 # CACHE
 # ═══════════════════════════════════════════════
@@ -122,108 +113,83 @@ def set_cached(key, data):
     cache[key] = (data, datetime.now().timestamp())
 
 # ═══════════════════════════════════════════════
-# HTTP HELPER
+# HTTP HELPERS
 # ═══════════════════════════════════════════════
-def http_get(url, headers=None):
+def http_get_raw(url, headers=None):
     try:
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         
-        req = urllib.request.Request(url, headers=headers or HEADERS)
+        default_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        
+        if headers:
+            default_headers.update(headers)
+        
+        req = urllib.request.Request(url, headers=default_headers)
         resp = urllib.request.urlopen(req, timeout=15, context=ctx)
         
-        # Handle gzip
-        if resp.info().get('Content-Encoding') == 'gzip':
-            import gzip
-            return gzip.decompress(resp.read()).decode('utf-8')
+        raw_data = resp.read()
         
-        return resp.read().decode('utf-8')
+        if raw_data[:2] == b'\x1f\x8b':
+            try:
+                raw_data = gzip.decompress(raw_data)
+            except:
+                pass
+        
+        encoding = resp.info().get('Content-Encoding', '')
+        if 'gzip' in encoding.lower() and raw_data[:2] != b'\x1f\x8b':
+            try:
+                raw_data = gzip.decompress(raw_data)
+            except:
+                pass
+        
+        return raw_data.decode('utf-8')
+        
     except Exception as e:
         raise Exception(f"HTTP Error: {str(e)}")
 
+
 def http_get_json(url, headers=None):
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        
-        req = urllib.request.Request(url, headers=headers or HEADERS)
-        resp = urllib.request.urlopen(req, timeout=15, context=ctx)
-        return json.loads(resp.read().decode('utf-8'))
+        text = http_get_raw(url, headers)
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise Exception(f"JSON Error: {str(e)}")
     except Exception as e:
-        raise Exception(f"HTTP Error: {str(e)}")
+        raise e
 
 # ═══════════════════════════════════════════════
 # SCRAPERS
 # ═══════════════════════════════════════════════
 
 def scrape_binance(interval, limit):
-    """BTC from Binance — free, no key, reliable"""
-    iv = "1m" if interval == "1min" else "15m"
-    url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={iv}&limit={limit}"
-    data = http_get_json(url)
-    et = pytz.timezone('US/Eastern')
-    candles = []
-    for k in data:
-        dt = datetime.fromtimestamp(int(k[0]) / 1000, tz=et)
-        candles.append({
-            "time": dt.strftime("%H:%M"),
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4])
-        })
-    return candles, None
-
-
-def scrape_investing_historical(pair_id, interval="1", count=500):
-    """
-    Scrape historical candle data from Investing.com
-    interval: "1" = 1min, "5" = 5min, "15" = 15min, "60" = 1hour
-    """
     try:
-        et = pytz.timezone('US/Eastern')
-        now = datetime.now(et)
-        
-        # Calculate timestamps
-        end_ts = int(now.timestamp())
-        
-        # For 1min data, go back ~8 hours; for 15min, go back ~3 days
-        if interval == "1":
-            start_ts = end_ts - (8 * 60 * 60)  # 8 hours
-        else:
-            start_ts = end_ts - (3 * 24 * 60 * 60)  # 3 days
-        
-        url = f"https://tvc6.investing.com/bc498743e6cd7b99f089f1c5c1c9e5d7/{end_ts}/1/1/8/history?symbol={pair_id}&resolution={interval}&from={start_ts}&to={end_ts}"
+        iv = "1m" if interval == "1min" else "15m"
+        url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={iv}&limit={limit}"
         
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0",
             "Accept": "application/json",
-            "Referer": "https://www.investing.com/",
-            "Origin": "https://www.investing.com",
         }
         
         data = http_get_json(url, headers)
         
-        if data.get("s") != "ok":
-            return [], f"Investing API returned: {data.get('s', 'unknown')}"
-        
+        et = pytz.timezone('US/Eastern')
         candles = []
-        times = data.get("t", [])
-        opens = data.get("o", [])
-        highs = data.get("h", [])
-        lows = data.get("l", [])
-        closes = data.get("c", [])
         
-        for i in range(len(times)):
-            dt = datetime.fromtimestamp(times[i], tz=et)
+        for k in data:
+            dt = datetime.fromtimestamp(int(k[0]) / 1000, tz=et)
             candles.append({
                 "time": dt.strftime("%H:%M"),
-                "open": float(opens[i]),
-                "high": float(highs[i]),
-                "low": float(lows[i]),
-                "close": float(closes[i])
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4])
             })
         
         return candles, None
@@ -233,12 +199,6 @@ def scrape_investing_historical(pair_id, interval="1", count=500):
 
 
 def scrape_yahoo_finance(symbol, interval="1m", period="1d"):
-    """
-    Fallback: Scrape from Yahoo Finance
-    symbol: "GC=F" for Gold, "NQ=F" for Nasdaq futures
-    interval: "1m", "5m", "15m"
-    period: "1d", "5d"
-    """
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range={period}"
         
@@ -257,19 +217,32 @@ def scrape_yahoo_finance(symbol, interval="1m", period="1d"):
         timestamps = quotes.get("timestamp", [])
         ohlc = quotes.get("indicators", {}).get("quote", [{}])[0]
         
+        if not timestamps:
+            return [], "No timestamps in Yahoo response"
+        
         et = pytz.timezone('US/Eastern')
         candles = []
         
         for i in range(len(timestamps)):
-            if ohlc.get("open") and ohlc["open"][i] is not None:
+            try:
+                o = ohlc.get("open", [])[i]
+                h = ohlc.get("high", [])[i]
+                l = ohlc.get("low", [])[i]
+                c = ohlc.get("close", [])[i]
+                
+                if o is None or h is None or l is None or c is None:
+                    continue
+                
                 dt = datetime.fromtimestamp(timestamps[i], tz=et)
                 candles.append({
                     "time": dt.strftime("%H:%M"),
-                    "open": float(ohlc["open"][i]),
-                    "high": float(ohlc["high"][i]),
-                    "low": float(ohlc["low"][i]),
-                    "close": float(ohlc["close"][i])
+                    "open": float(o),
+                    "high": float(h),
+                    "low": float(l),
+                    "close": float(c)
                 })
+            except (IndexError, TypeError):
+                continue
         
         return candles, None
         
@@ -277,36 +250,66 @@ def scrape_yahoo_finance(symbol, interval="1m", period="1d"):
         return [], str(e)
 
 
-def scrape_tradingview_data(symbol):
-    """
-    Alternative: Get data from TradingView's public API
-    """
+def scrape_investing(pair_id, interval="1", count=500):
     try:
-        # TradingView uses a websocket, but we can get snapshot data
-        url = f"https://scanner.tradingview.com/forex/scan"
+        et = pytz.timezone('US/Eastern')
+        now = datetime.now(et)
+        end_ts = int(now.timestamp())
         
-        payload = {
-            "symbols": {"tickers": [symbol]},
-            "columns": ["open", "high", "low", "close", "change"]
+        if interval == "1":
+            start_ts = end_ts - (12 * 60 * 60)
+        else:
+            start_ts = end_ts - (5 * 24 * 60 * 60)
+        
+        url = f"https://tvc6.investing.com/bc498743e6cd7b99f089f1c5c1c9e5d7/{end_ts}/1/1/8/history?symbol={pair_id}&resolution={interval}&from={start_ts}&to={end_ts}"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.investing.com/",
+            "Origin": "https://www.investing.com",
         }
         
-        # This is limited - TradingView doesn't have easy historical API
-        # Keeping as placeholder
-        return [], "TradingView requires websocket"
+        data = http_get_json(url, headers)
+        
+        if data.get("s") != "ok":
+            return [], f"Investing returned: {data.get('s', 'error')}"
+        
+        times = data.get("t", [])
+        opens = data.get("o", [])
+        highs = data.get("h", [])
+        lows = data.get("l", [])
+        closes = data.get("c", [])
+        
+        if not times:
+            return [], "No candle data"
+        
+        candles = []
+        for i in range(len(times)):
+            dt = datetime.fromtimestamp(times[i], tz=et)
+            candles.append({
+                "time": dt.strftime("%H:%M"),
+                "open": float(opens[i]),
+                "high": float(highs[i]),
+                "low": float(lows[i]),
+                "close": float(closes[i])
+            })
+        
+        return candles, None
         
     except Exception as e:
         return [], str(e)
 
 
 def scrape_asset(asset):
-    """Main scraper - routes to correct source with fallbacks"""
     cached = get_cached(asset)
     if cached:
         return cached
 
+    config = CONFIGS[asset]
     result = {
         "asset": asset, 
-        "tv": CONFIGS[asset]["tv"],
+        "tv": config["tv"],
         "status": "ERROR", 
         "candles": [],
         "ma50": None, 
@@ -316,56 +319,44 @@ def scrape_asset(asset):
         "source": None
     }
 
+    candles_15 = []
+    candles_1 = []
+    
     try:
-        # ═══════════════════════════════════════════════
-        # BTCUSD - Use Binance (most reliable)
-        # ═══════════════════════════════════════════════
         if asset == "BTCUSD":
-            candles_15, err_15 = scrape_binance("15min", 300)
-            candles_1, err_1 = scrape_binance("1min", 500)
-            result["source"] = "Binance"
-            
-            if err_15 or err_1:
-                result["error"] = err_15 or err_1
-                set_cached(asset, result)
-                return result
-        
-        # ═══════════════════════════════════════════════
-        # GOLD & NAS100 - Try Investing.com first, then Yahoo
-        # ═══════════════════════════════════════════════
-        else:
-            pair_id = CONFIGS[asset]["investing_id"]
-            
-            # Try Investing.com first
-            candles_15, err_15 = scrape_investing_historical(pair_id, "15", 300)
-            
-            if not candles_15 or len(candles_15) < 50:
-                # Fallback to Yahoo Finance
-                yahoo_symbol = "GC=F" if asset == "GOLD" else "NQ=F"
-                candles_15, err_15 = scrape_yahoo_finance(yahoo_symbol, "15m", "5d")
-                result["source"] = "Yahoo Finance"
+            candles_15, err = scrape_binance("15min", 300)
+            if candles_15 and len(candles_15) >= 50:
+                candles_1, _ = scrape_binance("1min", 500)
+                result["source"] = "Binance"
             else:
+                candles_15, err = scrape_yahoo_finance("BTC-USD", "15m", "5d")
+                candles_1, _ = scrape_yahoo_finance("BTC-USD", "1m", "1d")
+                result["source"] = "Yahoo Finance"
+                
+                if not candles_15:
+                    result["error"] = f"All sources failed: {err}"
+                    set_cached(asset, result)
+                    return result
+        
+        else:
+            pair_id = config["investing_id"]
+            yahoo_symbol = config["yahoo"]
+            
+            candles_15, err = scrape_investing(pair_id, "15", 300)
+            
+            if candles_15 and len(candles_15) >= 50:
+                candles_1, _ = scrape_investing(pair_id, "1", 500)
                 result["source"] = "Investing.com"
-            
-            if not candles_15 or len(candles_15) < 50:
-                result["error"] = f"15min data failed: {err_15}"
-                set_cached(asset, result)
-                return result
-            
-            # Get 1min data
-            candles_1, err_1 = scrape_investing_historical(pair_id, "1", 500)
-            
-            if not candles_1 or len(candles_1) < 30:
-                yahoo_symbol = "GC=F" if asset == "GOLD" else "NQ=F"
-                candles_1, err_1 = scrape_yahoo_finance(yahoo_symbol, "1m", "1d")
-            
-            if not candles_1:
-                result["error"] = f"1min data failed: {err_1}"
-                result["status"] = "NO_1MIN"
+            else:
+                candles_15, err = scrape_yahoo_finance(yahoo_symbol, "15m", "5d")
+                candles_1, _ = scrape_yahoo_finance(yahoo_symbol, "1m", "1d")
+                result["source"] = "Yahoo Finance"
+                
+                if not candles_15:
+                    result["error"] = f"All sources failed: {err}"
+                    set_cached(asset, result)
+                    return result
 
-        # ═══════════════════════════════════════════════
-        # Calculate MAs
-        # ═══════════════════════════════════════════════
         if len(candles_15) >= 200:
             closes = [c['close'] for c in candles_15]
             result["ma50"] = round(sum(closes[-50:]) / 50, 2)
@@ -373,19 +364,23 @@ def scrape_asset(asset):
         elif len(candles_15) >= 50:
             closes = [c['close'] for c in candles_15]
             result["ma50"] = round(sum(closes[-50:]) / 50, 2)
-            result["ma200"] = result["ma50"]  # Use MA50 as fallback
+            result["ma200"] = round(sum(closes) / len(closes), 2)
         else:
-            result["error"] = f"Only {len(candles_15)} bars (need 50+)"
+            result["error"] = f"Only {len(candles_15)} 15min bars (need 50+)"
             set_cached(asset, result)
             return result
 
-        if candles_1:
+        if candles_1 and len(candles_1) > 0:
             result["candles"] = candles_1
             result["price"] = round(candles_1[-1]['close'], 2)
             result["status"] = "OK"
             result["candle_count"] = len(candles_1)
         else:
-            result["status"] = "NO_1MIN"
+            result["candles"] = candles_15[-60:]
+            result["price"] = round(candles_15[-1]['close'], 2)
+            result["status"] = "OK"
+            result["candle_count"] = len(candles_15)
+            result["source"] += " (15min)"
 
     except Exception as e:
         result["error"] = str(e)
@@ -401,7 +396,7 @@ def scrape_all():
     return results
 
 # ═══════════════════════════════════════════════
-# WINDOW DETECTION (for Gold)
+# WINDOW DETECTION
 # ═══════════════════════════════════════════════
 def get_current_window(asset, now):
     config = CONFIGS[asset]
@@ -440,7 +435,6 @@ def score_trade(asset, range_size, fvg_size, speed, direction, date, window=None
     score = 0
     reasons = []
     
-    # Rejection filters
     if c["max_range"] and range_size > c["max_range"]:
         return {"score":0,"take_trade":False,"confidence":"REJECTED","reasons":["Range too wide"]}
     if c["max_fvg"] and fvg_size > c["max_fvg"]:
@@ -448,13 +442,11 @@ def score_trade(asset, range_size, fvg_size, speed, direction, date, window=None
     if c["max_speed"] and speed > c["max_speed"]:
         return {"score":0,"take_trade":False,"confidence":"REJECTED","reasons":["Breakout too slow"]}
     
-    # Window scoring (Gold)
     if c.get("windows") and window and window in c["windows"]:
         w = c["windows"][window]
         score += w["score"]
         reasons.append(f"{window} window ({w['wr']}) → +{w['score']}")
     
-    # Range scoring
     for low, high, pts in c["range"]:
         if low <= range_size <= high:
             score += pts
@@ -462,7 +454,6 @@ def score_trade(asset, range_size, fvg_size, speed, direction, date, window=None
                 reasons.append(f"Range ${low}-${high} → +{pts}")
             break
     
-    # FVG scoring
     for low, high, pts in c["fvg"]:
         if low <= fvg_size <= high:
             score += pts
@@ -470,7 +461,6 @@ def score_trade(asset, range_size, fvg_size, speed, direction, date, window=None
                 reasons.append(f"FVG ${low}-${high} → +{pts}")
             break
     
-    # Speed scoring
     for low, high, pts in c["speed"]:
         if low <= speed <= high:
             score += pts
@@ -478,7 +468,6 @@ def score_trade(asset, range_size, fvg_size, speed, direction, date, window=None
                 reasons.append(f"Speed {low}-{high} bars → +{pts}")
             break
     
-    # Day scoring
     try:
         y, m, d = map(int, str(date).split('-')[:3])
         day = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][datetime(y,m,d).weekday()]
@@ -499,12 +488,10 @@ def score_trade(asset, range_size, fvg_size, speed, direction, date, window=None
         score += c["worst_day"][1]
         reasons.append(f"{day} → {c['worst_day'][1]} ⚠️")
     
-    # Directional bias
     if c["bias"] and direction == c["bias"][0]:
         score += c["bias"][1]
         reasons.append(f"{direction} bias → +{c['bias'][1]}")
     
-    # Confidence levels
     min_score = c.get("min_score", 5)
     
     if asset == "GOLD":
@@ -551,11 +538,9 @@ def run_scan(asset, scraped):
         "source": scraped.get("source", "Unknown")
     }
 
-    # Weekend check
     if not config["weekend"] and now.weekday() >= 5:
         return {**base, "status": "CLOSED", "message": "Weekend — markets closed"}
     
-    # Gold multi-window check
     if asset == "GOLD" and config.get("windows"):
         if not current_window:
             next_w = next_window or "08:00 tomorrow"
@@ -569,7 +554,6 @@ def run_scan(asset, scraped):
                 "trend": "BULLISH" if scraped.get("ma50", 0) > scraped.get("ma200", 0) else "BEARISH"
             }
     else:
-        # Standard market hours
         if not config["weekend"] and now.hour < 9:
             h = 9 - now.hour
             m = 30 - now.minute
@@ -581,7 +565,6 @@ def run_scan(asset, scraped):
         if not config["weekend"] and now.hour >= 17:
             return {**base, "status": "CLOSED", "message": "NY session ended"}
 
-    # Check scraper status
     if scraped["status"] == "ERROR":
         return {**base, "status": "ERROR", "message": scraped.get("error", "Scraper failed")}
 
@@ -602,7 +585,6 @@ def run_scan(asset, scraped):
     candles = scraped["candles"]
     price = scraped["price"]
 
-    # Determine opening range candles
     if asset == "GOLD" and current_window:
         w = config["windows"][current_window]
         window_start = w["start"]
@@ -642,7 +624,6 @@ def run_scan(asset, scraped):
             "ma200": ma200
         }
 
-    # Post-range candles
     if asset == "GOLD" and current_window:
         w = config["windows"][current_window]
         post_start = w["start"] + 15
@@ -669,7 +650,6 @@ def run_scan(asset, scraped):
     today = now.strftime("%Y-%m-%d")
     bias_dir = "LONG" if trend == "BULLISH" else "SHORT"
 
-    # Scan for FVG breakout
     for i in range(len(post) - 2):
         c1, c2, c3 = post[i], post[i+1], post[i+2]
         
@@ -696,7 +676,8 @@ def run_scan(asset, scraped):
                     "confidence": pred["confidence"],
                     "reasons": pred["reasons"], 
                     "ma50": ma50, 
-                    "ma200": ma200
+                    "ma200": ma200,
+                    "fvg_detected": True
                 }
         
         if bias_dir == "SHORT" and c2['close'] < rl:
@@ -722,10 +703,10 @@ def run_scan(asset, scraped):
                     "confidence": pred["confidence"],
                     "reasons": pred["reasons"], 
                     "ma50": ma50, 
-                    "ma200": ma200
+                    "ma200": ma200,
+                    "fvg_detected": True
                 }
 
-    # No FVG found yet
     if price > rh:
         pm = f"Price ABOVE range (+${round(price - rh, 2)}) — Waiting for FVG"
     elif price < rl:
@@ -743,7 +724,8 @@ def run_scan(asset, scraped):
         "range_low": rl, 
         "range_size": rs,
         "ma50": ma50, 
-        "ma200": ma200
+        "ma200": ma200,
+        "fvg_detected": False
     }
 
 # ═══════════════════════════════════════════════
@@ -780,7 +762,7 @@ def health():
     return {"status": "ok", "time": datetime.now().isoformat()}
 
 # ═══════════════════════════════════════════════
-# UI
+# UI WITH FVG ICON
 # ═══════════════════════════════════════════════
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -788,7 +770,7 @@ def home():
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>ORB Scanner</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
@@ -807,300 +789,260 @@ tailwind.config={
 </script>
 <style>
   @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.5} }
+  @keyframes fvg-glow { 0%,100%{box-shadow:0 0 5px rgba(34,197,94,0.5)} 50%{box-shadow:0 0 20px rgba(34,197,94,0.8)} }
   .live-dot { animation: pulse-dot 2s infinite; }
+  .fvg-glow { animation: fvg-glow 1.5s infinite; }
   .glass { backdrop-filter: blur(10px); }
+  * { -webkit-tap-highlight-color: transparent; }
   
-  /* Mobile optimizations */
   @media (max-width: 640px) {
-    .card-grid { grid-template-columns: 1fr !important; }
     .info-grid { grid-template-columns: repeat(2, 1fr) !important; }
-  }
-  
-  /* Smooth transitions */
-  .card-transition {
-    transition: all 0.3s ease;
-  }
-  .card-transition:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
   }
 </style>
 </head>
-<body class="bg-bg text-gray-300 min-h-screen">
+<body class="bg-bg text-gray-300 min-h-screen overscroll-none">
 
-<header class="border-b border-border bg-card/50 glass sticky top-0 z-50">
-  <div class="w-[95%] xl:w-[85%] 2xl:w-[80%] mx-auto py-3 sm:py-4">
+<header class="border-b border-border bg-card/80 glass sticky top-0 z-50">
+  <div class="w-[96%] max-w-7xl mx-auto py-3">
     <div class="flex items-center justify-between">
       <div>
-        <h1 class="text-lg sm:text-xl font-bold text-white tracking-tight">ORB Scanner</h1>
-        <p class="text-[10px] sm:text-[11px] text-gray-600 mt-0.5">Opening Range Breakout · Multi-Asset</p>
+        <h1 class="text-base sm:text-xl font-bold text-white">ORB Scanner</h1>
+        <p class="text-[9px] sm:text-[11px] text-gray-600">Multi-Asset · Multi-Window</p>
       </div>
-      <div class="flex items-center gap-2 sm:gap-4">
-        <div class="text-right hidden sm:block">
-          <p class="text-sm text-white font-mono" id="clock">--:--:--</p>
-          <p class="text-[10px] text-gray-600" id="date">Loading...</p>
+      <div class="flex items-center gap-3">
+        <div class="text-right">
+          <p class="text-xs sm:text-sm text-white font-mono" id="clock">--:--:--</p>
+          <p class="text-[9px] sm:text-[10px] text-gray-600" id="date">Loading...</p>
         </div>
-        <div class="text-right sm:hidden">
-          <p class="text-xs text-white font-mono" id="clock-mobile">--:--</p>
-        </div>
-        <div class="flex items-center gap-1.5 sm:gap-2">
+        <div class="flex items-center gap-1.5">
           <span class="w-2 h-2 rounded-full bg-green-500 live-dot"></span>
-          <span class="text-[10px] sm:text-xs text-green-400 font-medium" id="status">CONNECTING</span>
+          <span class="text-[10px] text-green-400 font-medium" id="status">...</span>
         </div>
       </div>
     </div>
   </div>
 </header>
 
-<main class="w-[95%] xl:w-[85%] 2xl:w-[80%] mx-auto py-4 sm:py-6">
+<main class="w-[96%] max-w-7xl mx-auto py-4">
   
-  <!-- Stats Bar - Collapsible on mobile -->
-  <div class="grid grid-cols-4 gap-2 sm:gap-3 mb-4 sm:mb-6">
-    <div class="bg-card border border-border rounded-lg px-2 sm:px-4 py-2 sm:py-3">
-      <p class="text-[8px] sm:text-[10px] text-gray-600 uppercase tracking-wider">Markets</p>
-      <p class="text-sm sm:text-lg font-bold text-white mt-0.5 sm:mt-1">3</p>
+  <div class="grid grid-cols-4 gap-2 mb-4">
+    <div class="bg-card border border-border rounded-lg px-2 py-2 text-center">
+      <p class="text-[8px] text-gray-600 uppercase">Markets</p>
+      <p class="text-sm font-bold text-white">3</p>
     </div>
-    <div class="bg-card border border-border rounded-lg px-2 sm:px-4 py-2 sm:py-3">
-      <p class="text-[8px] sm:text-[10px] text-gray-600 uppercase tracking-wider">Refresh</p>
-      <p class="text-sm sm:text-lg font-bold text-white mt-0.5 sm:mt-1">2s</p>
+    <div class="bg-card border border-border rounded-lg px-2 py-2 text-center">
+      <p class="text-[8px] text-gray-600 uppercase">Interval</p>
+      <p class="text-sm font-bold text-white">2s</p>
     </div>
-    <div class="bg-card border border-border rounded-lg px-2 sm:px-4 py-2 sm:py-3">
-      <p class="text-[8px] sm:text-[10px] text-gray-600 uppercase tracking-wider">Updates</p>
-      <p class="text-sm sm:text-lg font-bold text-white mt-0.5 sm:mt-1" id="refresh-count">0</p>
+    <div class="bg-card border border-border rounded-lg px-2 py-2 text-center">
+      <p class="text-[8px] text-gray-600 uppercase">Updates</p>
+      <p class="text-sm font-bold text-white" id="refresh-count">0</p>
     </div>
-    <div class="bg-card border border-border rounded-lg px-2 sm:px-4 py-2 sm:py-3">
-      <p class="text-[8px] sm:text-[10px] text-gray-600 uppercase tracking-wider">Last</p>
-      <p class="text-sm sm:text-lg font-bold text-white mt-0.5 sm:mt-1 font-mono" id="last-update">--:--</p>
-    </div>
-  </div>
-
-  <!-- Scanner Cards -->
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4 card-grid" id="dashboard">
-    <div class="bg-card border border-border rounded-xl p-4 sm:p-6 animate-pulse">
-      <div class="h-4 bg-accent rounded w-24 mb-4"></div>
-      <div class="h-8 bg-accent rounded w-32 mb-3"></div>
-      <div class="h-4 bg-accent rounded w-full"></div>
-    </div>
-    <div class="bg-card border border-border rounded-xl p-4 sm:p-6 animate-pulse">
-      <div class="h-4 bg-accent rounded w-24 mb-4"></div>
-      <div class="h-8 bg-accent rounded w-32 mb-3"></div>
-      <div class="h-4 bg-accent rounded w-full"></div>
-    </div>
-    <div class="bg-card border border-border rounded-xl p-4 sm:p-6 animate-pulse">
-      <div class="h-4 bg-accent rounded w-24 mb-4"></div>
-      <div class="h-8 bg-accent rounded w-32 mb-3"></div>
-      <div class="h-4 bg-accent rounded w-full"></div>
+    <div class="bg-card border border-border rounded-lg px-2 py-2 text-center">
+      <p class="text-[8px] text-gray-600 uppercase">Last</p>
+      <p class="text-sm font-bold text-white font-mono" id="last-update">--:--</p>
     </div>
   </div>
 
-  <!-- Footer -->
-  <div class="mt-4 sm:mt-6 text-center">
-    <p class="text-[9px] sm:text-[10px] text-gray-700">
-      Sources: Binance · Investing.com · Yahoo Finance · 
-      <a href="/api/debug" class="text-blue-500 hover:underline">Debug</a> · 
-      <a href="/api/scan" class="text-blue-500 hover:underline">JSON</a>
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-3" id="dashboard">
+    <div class="bg-card border border-border rounded-xl p-5 animate-pulse"><div class="h-4 bg-accent rounded w-20 mb-3"></div><div class="h-6 bg-accent rounded w-28"></div></div>
+    <div class="bg-card border border-border rounded-xl p-5 animate-pulse"><div class="h-4 bg-accent rounded w-20 mb-3"></div><div class="h-6 bg-accent rounded w-28"></div></div>
+    <div class="bg-card border border-border rounded-xl p-5 animate-pulse"><div class="h-4 bg-accent rounded w-20 mb-3"></div><div class="h-6 bg-accent rounded w-28"></div></div>
+  </div>
+
+  <div class="mt-4 text-center">
+    <p class="text-[9px] text-gray-700">
+      Binance · Investing.com · Yahoo · 
+      <a href="/api/debug" class="text-blue-500">Debug</a>
     </p>
   </div>
 </main>
 
 <script>
-const STATUS_CONFIG = {
-  TRADE:      { bg:'bg-green-500/10',  border:'border-green-500/40',  text:'text-green-400',  label:'TRADE' },
-  SKIP:       { bg:'bg-yellow-500/10', border:'border-yellow-500/40', text:'text-yellow-400', label:'SKIP' },
-  SCANNING:   { bg:'bg-blue-500/10',   border:'border-blue-500/40',   text:'text-blue-400',   label:'SCANNING' },
-  CLOSED:     { bg:'bg-gray-500/10',   border:'border-gray-500/40',   text:'text-gray-500',   label:'CLOSED' },
-  PRE_MARKET: { bg:'bg-purple-500/10', border:'border-purple-500/40', text:'text-purple-400', label:'PRE-MKT' },
-  WAITING:    { bg:'bg-purple-500/10', border:'border-purple-500/40', text:'text-purple-400', label:'WAITING' },
-  FORMING:    { bg:'bg-indigo-500/10', border:'border-indigo-500/40', text:'text-indigo-400', label:'FORMING' },
-  NO_TRADE:   { bg:'bg-orange-500/10', border:'border-orange-500/40', text:'text-orange-400', label:'NO TRADE' },
-  ERROR:      { bg:'bg-red-500/10',    border:'border-red-500/40',    text:'text-red-400',    label:'ERROR' }
-};
+const ST={TRADE:{bg:'bg-green-500/10',bd:'border-green-500/40',tx:'text-green-400',lb:'TRADE'},SKIP:{bg:'bg-yellow-500/10',bd:'border-yellow-500/40',tx:'text-yellow-400',lb:'SKIP'},SCANNING:{bg:'bg-blue-500/10',bd:'border-blue-500/40',tx:'text-blue-400',lb:'SCAN'},CLOSED:{bg:'bg-gray-500/10',bd:'border-gray-500/40',tx:'text-gray-500',lb:'CLOSED'},PRE_MARKET:{bg:'bg-purple-500/10',bd:'border-purple-500/40',tx:'text-purple-400',lb:'PRE'},WAITING:{bg:'bg-purple-500/10',bd:'border-purple-500/40',tx:'text-purple-400',lb:'WAIT'},FORMING:{bg:'bg-indigo-500/10',bd:'border-indigo-500/40',tx:'text-indigo-400',lb:'FORM'},NO_TRADE:{bg:'bg-orange-500/10',bd:'border-orange-500/40',tx:'text-orange-400',lb:'NO'},ERROR:{bg:'bg-red-500/10',bd:'border-red-500/40',tx:'text-red-400',lb:'ERR'}};
 
-function badge(status) {
-  const c = STATUS_CONFIG[status] || STATUS_CONFIG.ERROR;
-  return `<span class="inline-flex items-center px-2 sm:px-3 py-0.5 sm:py-1 rounded-full text-[9px] sm:text-[11px] font-semibold ${c.bg} ${c.border} ${c.text} border uppercase tracking-wide">${c.label}</span>`;
-}
-
-function infoBox(label, value, color = 'text-white') {
-  return `
-    <div class="bg-bg/50 border border-border rounded-lg px-2 sm:px-3 py-1.5 sm:py-2.5">
-      <p class="text-[8px] sm:text-[9px] text-gray-600 uppercase tracking-wider">${label}</p>
-      <p class="text-xs sm:text-sm font-semibold mt-0.5 ${color} truncate">${value}</p>
-    </div>`;
-}
-
-function scoreBar(score) {
-  const pct = Math.min(Math.round(score / 12 * 100), 100);
-  const color = score >= 9 ? '#22c55e' : score >= 7 ? '#84cc16' : score >= 5 ? '#eab308' : '#ef4444';
-  return `
-    <div class="mt-2 sm:mt-3">
-      <div class="flex justify-between text-[9px] sm:text-[10px] mb-1">
-        <span class="text-gray-500">Score</span>
-        <span class="font-bold" style="color:${color}">${score}/12</span>
-      </div>
-      <div class="bg-gray-800 rounded-full h-1.5 sm:h-2 overflow-hidden">
-        <div class="h-full rounded-full transition-all duration-500" style="width:${pct}%;background:${color}"></div>
-      </div>
-    </div>`;
-}
-
-function renderCard(d) {
-  const isTrade = d.status === 'TRADE' || d.status === 'SKIP';
-  const dirColor = d.direction === 'LONG' ? 'text-green-400' : 'text-red-400';
-  const dirIcon = d.direction === 'LONG' ? '↑' : '↓';
-  const trendColor = d.trend === 'BULLISH' ? 'text-green-400' : d.trend === 'BEARISH' ? 'text-red-400' : 'text-gray-400';
+// FVG Icon SVG - Shows 3 candles with gap
+const fvgIconLong = `
+<svg viewBox="0 0 60 40" class="w-12 h-8">
+  <!-- Candle 1 (left) - bearish -->
+  <rect x="5" y="8" width="8" height="20" fill="#ef4444" rx="1"/>
+  <line x1="9" y1="4" x2="9" y2="8" stroke="#ef4444" stroke-width="2"/>
+  <line x1="9" y1="28" x2="9" y2="34" stroke="#ef4444" stroke-width="2"/>
   
-  let html = `
-    <div class="bg-card border border-border rounded-xl overflow-hidden card-transition ${d.status === 'TRADE' ? 'ring-2 ring-green-500/50' : ''}">
-      <div class="px-3 sm:px-5 py-3 sm:py-4 border-b border-border flex items-center justify-between">
-        <div class="min-w-0 flex-1">
-          <div class="flex items-center gap-2">
-            <p class="text-[10px] sm:text-xs text-gray-400 font-semibold">${d.asset}</p>
-            ${d.window ? `<span class="text-[8px] sm:text-[10px] text-purple-400 bg-purple-500/10 px-1.5 py-0.5 rounded">${d.window}</span>` : ''}
-          </div>
-          <p class="text-[8px] sm:text-[10px] text-gray-600 font-mono truncate">${d.source || d.tv}</p>
-        </div>
-        ${badge(d.status)}
-      </div>
-      
-      <div class="px-3 sm:px-5 py-3 sm:py-4">
-        <p class="text-xs sm:text-sm text-white mb-3 sm:mb-4">${d.message}</p>`;
+  <!-- Candle 2 (middle) - big bullish impulse -->
+  <rect x="22" y="4" width="10" height="28" fill="#22c55e" rx="1"/>
+  <line x1="27" y1="2" x2="27" y2="4" stroke="#22c55e" stroke-width="2"/>
+  <line x1="27" y1="32" x2="27" y2="36" stroke="#22c55e" stroke-width="2"/>
   
-  if (isTrade) {
-    html += `
-        <div class="grid grid-cols-2 gap-1.5 sm:gap-2 mb-2 sm:mb-3">
-          ${infoBox('Direction', `${dirIcon} ${d.direction}`, dirColor)}
-          ${infoBox('Confidence', d.confidence, d.confidence === 'HIGH' ? 'text-green-400' : d.confidence === 'MEDIUM' ? 'text-yellow-400' : 'text-red-400')}
+  <!-- Candle 3 (right) - bullish -->
+  <rect x="41" y="6" width="8" height="16" fill="#22c55e" rx="1"/>
+  <line x1="45" y1="2" x2="45" y2="6" stroke="#22c55e" stroke-width="2"/>
+  <line x1="45" y1="22" x2="45" y2="28" stroke="#22c55e" stroke-width="2"/>
+  
+  <!-- FVG Zone (gap between candle 1 high and candle 3 low) -->
+  <rect x="13" y="8" width="28" height="6" fill="#22c55e" fill-opacity="0.2" stroke="#22c55e" stroke-width="1" stroke-dasharray="2,2" rx="2"/>
+  
+  <!-- Arrow pointing to gap -->
+  <path d="M 27 17 L 27 11" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#arrowGreen)"/>
+  <defs>
+    <marker id="arrowGreen" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+      <path d="M 0 0 L 6 3 L 0 6 Z" fill="#22c55e"/>
+    </marker>
+  </defs>
+</svg>`;
+
+const fvgIconShort = `
+<svg viewBox="0 0 60 40" class="w-12 h-8">
+  <!-- Candle 1 (left) - bullish -->
+  <rect x="5" y="12" width="8" height="20" fill="#22c55e" rx="1"/>
+  <line x1="9" y1="6" x2="9" y2="12" stroke="#22c55e" stroke-width="2"/>
+  <line x1="9" y1="32" x2="9" y2="36" stroke="#22c55e" stroke-width="2"/>
+  
+  <!-- Candle 2 (middle) - big bearish impulse -->
+  <rect x="22" y="8" width="10" height="28" fill="#ef4444" rx="1"/>
+  <line x1="27" y1="4" x2="27" y2="8" stroke="#ef4444" stroke-width="2"/>
+  <line x1="27" y1="36" x2="27" y2="38" stroke="#ef4444" stroke-width="2"/>
+  
+  <!-- Candle 3 (right) - bearish -->
+  <rect x="41" y="18" width="8" height="16" fill="#ef4444" rx="1"/>
+  <line x1="45" y1="12" x2="45" y2="18" stroke="#ef4444" stroke-width="2"/>
+  <line x1="45" y1="34" x2="45" y2="38" stroke="#ef4444" stroke-width="2"/>
+  
+  <!-- FVG Zone (gap between candle 1 low and candle 3 high) -->
+  <rect x="13" y="26" width="28" height="6" fill="#ef4444" fill-opacity="0.2" stroke="#ef4444" stroke-width="1" stroke-dasharray="2,2" rx="2"/>
+  
+  <!-- Arrow pointing to gap -->
+  <path d="M 27 23 L 27 29" stroke="#ef4444" stroke-width="1.5" fill="none" marker-end="url(#arrowRed)"/>
+  <defs>
+    <marker id="arrowRed" markerWidth="6" markerHeight="6" refX="3" refY="3" orient="auto">
+      <path d="M 0 0 L 6 3 L 0 6 Z" fill="#ef4444"/>
+    </marker>
+  </defs>
+</svg>`;
+
+// Waiting for FVG icon
+const fvgIconWaiting = `
+<svg viewBox="0 0 60 40" class="w-12 h-8 opacity-40">
+  <!-- Candle 1 -->
+  <rect x="8" y="10" width="8" height="18" fill="#6b7280" rx="1"/>
+  <line x1="12" y1="6" x2="12" y2="10" stroke="#6b7280" stroke-width="2"/>
+  <line x1="12" y1="28" x2="12" y2="34" stroke="#6b7280" stroke-width="2"/>
+  
+  <!-- Candle 2 -->
+  <rect x="24" y="8" width="8" height="22" fill="#6b7280" rx="1"/>
+  <line x1="28" y1="4" x2="28" y2="8" stroke="#6b7280" stroke-width="2"/>
+  <line x1="28" y1="30" x2="28" y2="36" stroke="#6b7280" stroke-width="2"/>
+  
+  <!-- Question mark / waiting indicator -->
+  <text x="46" y="24" font-size="16" fill="#6b7280" font-weight="bold">?</text>
+</svg>`;
+
+const badge=s=>{const c=ST[s]||ST.ERROR;return`<span class="px-2 py-0.5 rounded-full text-[9px] font-bold ${c.bg} ${c.bd} ${c.tx} border">${c.lb}</span>`};
+const box=(l,v,c='text-white')=>`<div class="bg-bg/50 border border-border rounded px-2 py-1.5"><p class="text-[8px] text-gray-600 uppercase">${l}</p><p class="text-xs font-semibold ${c} truncate">${v}</p></div>`;
+const bar=s=>{const p=Math.min(Math.round(s/12*100),100),c=s>=9?'#22c55e':s>=7?'#84cc16':s>=5?'#eab308':'#ef4444';return`<div class="mt-2"><div class="flex justify-between text-[9px] mb-1"><span class="text-gray-500">Score</span><span class="font-bold" style="color:${c}">${s}/12</span></div><div class="bg-gray-800 rounded-full h-1.5"><div class="h-full rounded-full" style="width:${p}%;background:${c}"></div></div></div>`};
+
+// FVG indicator component
+function fvgIndicator(d) {
+  if (d.fvg_detected && d.direction) {
+    const icon = d.direction === 'LONG' ? fvgIconLong : fvgIconShort;
+    const color = d.direction === 'LONG' ? 'border-green-500/50 bg-green-500/5' : 'border-red-500/50 bg-red-500/5';
+    return `
+      <div class="flex items-center gap-2 p-2 rounded-lg border ${color} fvg-glow">
+        ${icon}
+        <div>
+          <p class="text-[9px] text-gray-400 uppercase">FVG Detected</p>
+          <p class="text-xs font-bold ${d.direction === 'LONG' ? 'text-green-400' : 'text-red-400'}">${d.direction} $${d.fvg_size}</p>
         </div>
-        
-        ${scoreBar(d.score)}
-        
-        <div class="border-t border-border my-3 sm:my-4"></div>
-        
-        <div class="grid grid-cols-2 sm:grid-cols-4 gap-1.5 sm:gap-2 info-grid">
-          ${infoBox('Entry', '$' + d.entry, dirColor)}
-          ${infoBox('Stop', '$' + d.stop, 'text-red-400')}
-          ${infoBox('Target', '$' + d.target, 'text-green-400')}
-          ${infoBox('Price', '$' + d.price)}
+      </div>`;
+  } else if (d.status === 'SCANNING') {
+    return `
+      <div class="flex items-center gap-2 p-2 rounded-lg border border-gray-700/50 bg-gray-800/30">
+        ${fvgIconWaiting}
+        <div>
+          <p class="text-[9px] text-gray-500 uppercase">Waiting for FVG</p>
+          <p class="text-[10px] text-gray-600">Scanning...</p>
         </div>
-        
-        <div class="grid grid-cols-2 sm:grid-cols-4 gap-1.5 sm:gap-2 mt-1.5 sm:mt-2 info-grid">
-          ${infoBox('Range', '$' + d.range_size)}
-          ${infoBox('FVG', '$' + d.fvg_size)}
-          ${infoBox('Speed', d.speed + ' bars')}
-          ${infoBox('Trend', d.trend, trendColor)}
-        </div>`;
-    
-    if (d.reasons && d.reasons.length) {
-      html += `
-        <div class="border-t border-border my-3 sm:my-4"></div>
-        <details class="group">
-          <summary class="text-[9px] sm:text-[10px] text-gray-600 uppercase tracking-wider cursor-pointer hover:text-gray-400 flex items-center gap-1">
-            Score Breakdown 
-            <svg class="w-3 h-3 transition-transform group-open:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
-            </svg>
-          </summary>
-          <div class="mt-2 space-y-0.5 sm:space-y-1">`;
-      d.reasons.forEach(r => {
-        const isPositive = r.includes('+');
-        html += `<p class="text-[10px] sm:text-[11px] ${isPositive ? 'text-green-400' : 'text-red-400'}"><span class="mr-1">${isPositive ? '✓' : '✗'}</span>${r}</p>`;
-      });
-      html += `</div></details>`;
-    }
-  } else if (['SCANNING', 'WAITING', 'FORMING', 'NO_TRADE'].includes(d.status)) {
-    html += `<div class="grid grid-cols-2 sm:grid-cols-3 gap-1.5 sm:gap-2 info-grid">`;
-    if (d.price) html += infoBox('Price', '$' + d.price);
-    if (d.trend) html += infoBox('Trend', d.trend, trendColor);
-    if (d.range_high) html += infoBox('High', '$' + d.range_high);
-    if (d.range_low) html += infoBox('Low', '$' + d.range_low);
-    if (d.range_size) html += infoBox('Range', '$' + d.range_size);
-    if (d.next_window) html += infoBox('Next', d.next_window, 'text-purple-400');
-    html += `</div>`;
-  } else if (d.trend) {
-    html += `<div class="grid grid-cols-2 gap-1.5 sm:gap-2 info-grid">`;
-    html += infoBox('Trend', d.trend, trendColor);
-    if (d.next_window) html += infoBox('Next', d.next_window, 'text-purple-400');
-    html += `</div>`;
+      </div>`;
   }
+  return '';
+}
+
+function render(d){
+  const tr=d.status==='TRADE'||d.status==='SKIP';
+  const dc=d.direction==='LONG'?'text-green-400':'text-red-400';
+  const di=d.direction==='LONG'?'↑':'↓';
+  const tc=d.trend==='BULLISH'?'text-green-400':d.trend==='BEARISH'?'text-red-400':'text-gray-400';
   
-  html += `
+  let h=`<div class="bg-card border border-border rounded-xl overflow-hidden ${d.status==='TRADE'?'ring-2 ring-green-500/50':''}">
+    <div class="px-4 py-3 border-b border-border flex items-center justify-between">
+      <div>
+        <div class="flex items-center gap-2">
+          <span class="text-xs font-semibold text-gray-300">${d.asset}</span>
+          ${d.window?`<span class="text-[8px] text-purple-400 bg-purple-500/10 px-1.5 py-0.5 rounded">${d.window}</span>`:''}
+        </div>
+        <p class="text-[9px] text-gray-600">${d.source||''}</p>
       </div>
-    </div>`;
+      ${badge(d.status)}
+    </div>
+    <div class="px-4 py-3">
+      <p class="text-xs text-white mb-3">${d.message}</p>`;
   
-  return html;
-}
-
-let refreshCount = 0;
-
-async function fetchData() {
-  const statusEl = document.getElementById('status');
-  
-  try {
-    statusEl.textContent = '⟳';
-    statusEl.className = 'text-xs text-blue-400 font-medium';
+  if(tr){
+    // FVG indicator for trade signals
+    h += fvgIndicator(d);
     
-    const response = await fetch('/api/scan');
-    const data = await response.json();
-    
-    document.getElementById('dashboard').innerHTML = 
-      renderCard(data.NAS100) + 
-      renderCard(data.BTCUSD) + 
-      renderCard(data.GOLD);
-    
-    refreshCount++;
-    document.getElementById('refresh-count').textContent = refreshCount;
-    document.getElementById('last-update').textContent = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-    
-    statusEl.textContent = 'LIVE';
-    statusEl.className = 'text-xs text-green-400 font-medium';
-    
-  } catch (error) {
-    console.error('Fetch error:', error);
-    statusEl.textContent = 'ERR';
-    statusEl.className = 'text-xs text-red-400 font-medium';
-  }
-}
-
-function updateClock() {
-  const now = new Date();
-  const etOptions = { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
-  const etShort = { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false };
-  const dateOptions = { timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric' };
-  
-  const clockEl = document.getElementById('clock');
-  const clockMobileEl = document.getElementById('clock-mobile');
-  const dateEl = document.getElementById('date');
-  
-  if (clockEl) clockEl.textContent = now.toLocaleTimeString('en-US', etOptions) + ' ET';
-  if (clockMobileEl) clockMobileEl.textContent = now.toLocaleTimeString('en-US', etShort);
-  if (dateEl) dateEl.textContent = now.toLocaleDateString('en-US', dateOptions);
-}
-
-// Initialize
-fetchData();
-updateClock();
-setInterval(fetchData, 2000);
-setInterval(updateClock, 1000);
-
-// Play sound on trade signal (optional)
-let lastTradeState = {};
-function checkForNewTrades(data) {
-  ['NAS100', 'BTCUSD', 'GOLD'].forEach(asset => {
-    if (data[asset]?.status === 'TRADE' && lastTradeState[asset] !== 'TRADE') {
-      // New trade signal!
-      if (Notification.permission === 'granted') {
-        new Notification(`${asset} TRADE SIGNAL`, { body: data[asset].message });
-      }
+    h+=`<div class="grid grid-cols-2 gap-1.5 mb-2 mt-3">${box('Dir',di+' '+d.direction,dc)}${box('Conf',d.confidence,d.confidence==='HIGH'?'text-green-400':'text-yellow-400')}</div>${bar(d.score)}
+    <div class="border-t border-border my-3"></div>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-1.5 info-grid">${box('Entry','$'+d.entry,dc)}${box('Stop','$'+d.stop,'text-red-400')}${box('Target','$'+d.target,'text-green-400')}${box('Price','$'+d.price)}</div>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-1.5 mt-1.5 info-grid">${box('Range','$'+d.range_size)}${box('FVG','$'+d.fvg_size)}${box('Speed',d.speed+' bars')}${box('Trend',d.trend,tc)}</div>`;
+    if(d.reasons?.length){h+=`<div class="border-t border-border my-3"></div><details><summary class="text-[9px] text-gray-500 cursor-pointer">Score Breakdown</summary><div class="mt-2 space-y-0.5">`;d.reasons.forEach(r=>{h+=`<p class="text-[10px] ${r.includes('+')?'text-green-400':'text-red-400'}">${r.includes('+')?'✓':'✗'} ${r}</p>`});h+=`</div></details>`}
+  }else if(['SCANNING','WAITING','FORMING','NO_TRADE'].includes(d.status)){
+    // FVG waiting indicator for scanning state
+    if (d.status === 'SCANNING') {
+      h += fvgIndicator(d);
+      h += `<div class="mt-3"></div>`;
     }
-    lastTradeState[asset] = data[asset]?.status;
-  });
+    
+    h+=`<div class="grid grid-cols-2 sm:grid-cols-3 gap-1.5 info-grid">`;
+    if(d.price)h+=box('Price','$'+d.price);
+    if(d.trend)h+=box('Trend',d.trend,tc);
+    if(d.range_high)h+=box('High','$'+d.range_high);
+    if(d.range_low)h+=box('Low','$'+d.range_low);
+    if(d.range_size)h+=box('Range','$'+d.range_size);
+    if(d.next_window)h+=box('Next',d.next_window,'text-purple-400');
+    h+=`</div>`;
+  }else{
+    h+=`<div class="grid grid-cols-2 gap-1.5">`;
+    if(d.trend)h+=box('Trend',d.trend,tc);
+    if(d.next_window)h+=box('Next',d.next_window,'text-purple-400');
+    h+=`</div>`;
+  }
+  h+=`</div></div>`;
+  return h;
 }
 
-// Request notification permission
-if ('Notification' in window && Notification.permission === 'default') {
-  Notification.requestPermission();
+let n=0;
+async function go(){
+  const st=document.getElementById('status');
+  try{
+    st.textContent='⟳';st.className='text-[10px] text-blue-400';
+    const r=await fetch('/api/scan'),d=await r.json();
+    document.getElementById('dashboard').innerHTML=render(d.NAS100)+render(d.BTCUSD)+render(d.GOLD);
+    n++;document.getElementById('refresh-count').textContent=n;
+    document.getElementById('last-update').textContent=new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false});
+    st.textContent='LIVE';st.className='text-[10px] text-green-400 font-medium';
+  }catch(e){st.textContent='ERR';st.className='text-[10px] text-red-400';}
 }
+
+function ck(){
+  const n=new Date();
+  document.getElementById('clock').textContent=n.toLocaleTimeString('en-US',{timeZone:'America/New_York',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})+' ET';
+  document.getElementById('date').textContent=n.toLocaleDateString('en-US',{timeZone:'America/New_York',weekday:'short',month:'short',day:'numeric'});
+}
+
+go();ck();setInterval(go,2000);setInterval(ck,1000);
+
+if('Notification'in window&&Notification.permission==='default')Notification.requestPermission();
 </script>
 </body>
 </html>"""
