@@ -16,7 +16,7 @@ app = FastAPI()
 # RAILWAY SCRAPER CONFIGURATION
 # ═══════════════════════════════════════════════
 # Set this env var to your Railway scraper URL:
-SCRAPER_URL=https://tradingview-scraper-production.up.railway.app/
+# SCRAPER_URL=https://tradingview-scraper-production.up.railway.app/
 #
 # Optional symbol overrides:
 #   SCRAPER_SYM_NAS100=NAS100
