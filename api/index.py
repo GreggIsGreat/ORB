@@ -16,12 +16,12 @@ app = FastAPI()
 # RAILWAY SCRAPER CONFIGURATION
 # ═══════════════════════════════════════════════
 # Set this env var to your Railway scraper URL:
-#   SCRAPER_URL=https://your-scraper.railway.app
+SCRAPER_URL=https://tradingview-scraper-production.up.railway.app/
 #
 # Optional symbol overrides:
-#   SCRAPER_SYM_NAS100=NAS100
-#   SCRAPER_SYM_BTCUSD=BTCUSD
-#   SCRAPER_SYM_GOLD=XAUUSD
+SCRAPER_SYM_NAS100=NAS100
+SCRAPER_SYM_BTCUSD=BTCUSD
+SCRAPER_SYM_GOLD=XAUUSD
 # ═══════════════════════════════════════════════
 SCRAPER_BASE_URL = os.environ.get("SCRAPER_URL", "").rstrip("/")
 
